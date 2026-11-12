@@ -12,13 +12,14 @@ import time
 import uuid
 import weakref
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
 import qrcode
 from telethon import TelegramClient, events, functions
+from telethon.tl import types
 from telethon.errors import (
     AuthKeyError,
     FloodWaitError,
@@ -49,7 +50,14 @@ from telegram.request import HTTPXRequest
 CONFIG_FILE = "config.json"
 ACCOUNTS_FILE = "db/accounts.json"
 LOG_DIR = "logs"
-PHONE_REGEX = re.compile(r"^\+\d{7,15}$")
+
+
+def _utcnow() -> datetime:
+    """Naive UTC datetime — replacement for deprecated datetime.utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+# [FIX #1] Accept +id... identifiers (QR accounts without phone).
+PHONE_REGEX = re.compile(r"^(?:\+\d{7,15}|\+id\d+)$")
 CODE_REGEX = re.compile(r"^\d{4,7}$")
 OTP_CODE_REGEX = re.compile(r"\b\d{5}\b")
 TELEGRAM_SERVICE_ID = 777000
@@ -59,8 +67,11 @@ BACKUP_RETENTION_COUNT = 5
 BACKUP_MIN_INTERVAL_SECONDS = 60
 USER_SESSION_SWEEP_INTERVAL = 3600
 USER_SESSION_IDLE_TIMEOUT = 3600
+STEP_TIMEOUT_SECONDS = 900           # [FIX #3] sweep stalled add-account flows
 ACCOUNTS_PER_PAGE = 20
 OTP_SESSION_SWEEP_DELAY_SECONDS = 4
+ADD_COOLDOWN_SECONDS = 120           # [FEAT E] per-user add-account cooldown
+UI_CACHE_TTL_SECONDS = 1800          # [FIX #9] TTL for ephemeral UI maps
 INVALID_SESSION_ERRORS = (AuthKeyError, UserDeactivatedError, UserDeactivatedBanError)
 
 
@@ -99,10 +110,25 @@ def setup_logging() -> logging.Logger:
     logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler], force=True)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telethon").setLevel(logging.WARNING)
+
+    # [FEAT G] Audit log — dedicated, non-propagating file logger.
+    audit = logging.getLogger("audit")
+    audit_path = Path(LOG_DIR) / "audit.log"
+    if not any(
+        isinstance(h, RotatingFileHandler) and Path(h.baseFilename) == audit_path
+        for h in audit.handlers
+    ):
+        ah = RotatingFileHandler(audit_path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8")
+        ah.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        audit.addHandler(ah)
+    audit.setLevel(logging.INFO)
+    audit.propagate = False
+
     return logging.getLogger("anti_login")
 
 
 logger = setup_logging()
+audit_logger = logging.getLogger("audit")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,6 +203,8 @@ def load_config(path: Path) -> Optional[Config]:
 
 
 def mask_phone(phone: str) -> str:
+    if phone.startswith("+id"):
+        return "+id***" + phone[-3:] if len(phone) > 6 else phone
     digits = phone.lstrip("+")
     if len(digits) <= 6:
         return "+" + digits[0] + "*" * (len(digits) - 1)
@@ -195,15 +223,15 @@ class AccountRecord:
     phone: str
     session_str: str
     anti_login: bool = False
-    created_at: str = dataclasses.field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = dataclasses.field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = dataclasses.field(default_factory=lambda: _utcnow().isoformat())
+    updated_at: str = dataclasses.field(default_factory=lambda: _utcnow().isoformat())
     invalidated_codes: int = 0
     whitelisted_sessions: list = dataclasses.field(default_factory=list)
     trusted_fingerprints: list = dataclasses.field(default_factory=list)
     whitelist_initialized: bool = False
 
     def touch(self):
-        self.updated_at = datetime.utcnow().isoformat()
+        self.updated_at = _utcnow().isoformat()
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -214,8 +242,8 @@ class AccountRecord:
             phone=phone,
             session_str=str(data["session_str"]),
             anti_login=bool(data.get("anti_login", False)),
-            created_at=str(data.get("created_at") or datetime.utcnow().isoformat()),
-            updated_at=str(data.get("updated_at") or datetime.utcnow().isoformat()),
+            created_at=str(data.get("created_at") or _utcnow().isoformat()),
+            updated_at=str(data.get("updated_at") or _utcnow().isoformat()),
             invalidated_codes=int(data.get("invalidated_codes", 0) or 0),
             whitelisted_sessions=list(data.get("whitelisted_sessions", []) or []),
             trusted_fingerprints=list(data.get("trusted_fingerprints", []) or []),
@@ -320,6 +348,17 @@ class AccountDatabase:
             self._records[record.phone] = record
             await self._save_locked()
 
+    async def mutate(self, phone: str, fn) -> Optional[AccountRecord]:
+        """[FIX #4] In-place mutation that NEVER re-creates a deleted record."""
+        async with self._lock:
+            record = self._records.get(phone)
+            if record is None:
+                return None
+            fn(record)
+            record.touch()
+            await self._save_locked()
+            return record
+
     async def remove(self, phone: str) -> bool:
         async with self._lock:
             if phone not in self._records:
@@ -365,7 +404,7 @@ class AccountDatabase:
         self._last_backup = now
 
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+        stamp = _utcnow().strftime("%Y%m%dT%H%M%S%f")
         backup_path = self.backup_dir / f"accounts_{stamp}.json"
         with suppress(Exception):
             backup_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -385,6 +424,7 @@ class SessionManager:
         self._reconnect_delays: dict[str, float] = {}
         self._reconnect_locks: dict[str, asyncio.Lock] = {}
         self._guarded_clients: weakref.WeakSet = weakref.WeakSet()
+        # [FIX #9] Store (phone, data, created_monotonic) so we can TTL them.
         self._ui_sessions: dict[str, tuple] = {}
         self._pending_fingerprints: dict[str, tuple] = {}
 
@@ -415,29 +455,33 @@ class SessionManager:
             await asyncio.gather(*(connect(p, r) for p, r in records))
 
     async def _connect_existing(self, phone: str, record: AccountRecord):
-        # [FIX #5] Use connect() + is_user_authorized() instead of start().
-        # start() can hang in headless environments (Docker) because it tries
-        # to read a phone number from stdin when the session is invalid.
         client = TelegramClient(StringSession(record.session_str), self.config.api_id, self.config.api_hash)
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 raise AuthKeyError("session no longer authorized")
             me = await client.get_me()
+            # [FIX #8] Register client AFTER setup succeeds, so a failure here
+            # never leaves a disconnected-but-registered entry.
             self.clients[phone] = client
-            self._setup_otp_guard(phone, client)
-            self.track(asyncio.create_task(self._supervise_client(phone, client)))
-            await self._ensure_whitelist_initialized(phone, client)
+            try:
+                self._setup_otp_guard(phone, client)
+                self.track(asyncio.create_task(self._supervise_client(phone, client)))
+                await self._ensure_whitelist_initialized(phone, client)
+            except Exception:
+                self.clients.pop(phone, None)
+                raise
             logger.info("Account loaded: %s (%s)", phone, me.first_name)
         except INVALID_SESSION_ERRORS as e:
             logger.error("Session for %s is no longer valid (%s). Removing from database.", phone, e)
             with suppress(Exception):
                 await client.disconnect()
+            self.clients.pop(phone, None)
             await self.database.remove(phone)
-            # [FIX #7] Also scrub backups so the dead session string cannot be reused.
             await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
             await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
         except Exception as e:
+            self.clients.pop(phone, None)
             logger.error("Failed to load account %s: %s. Will retry via health check.", phone, e)
             with suppress(Exception):
                 await client.disconnect()
@@ -454,15 +498,16 @@ class SessionManager:
         if phone in self.database:
             return False
         record = AccountRecord(phone=phone, session_str=client.session.save(), anti_login=False)
-        # [FIX #3] On failure, roll back state and remove the client from the
-        # registry so finish_add_account can safely LogOut without leaving a
-        # dangling entry.
         try:
             await self.database.upsert(record)
             self.clients[phone] = client
-            self._setup_otp_guard(phone, client)
-            self.track(asyncio.create_task(self._supervise_client(phone, client)))
-            await self._ensure_whitelist_initialized(phone, client)
+            try:
+                self._setup_otp_guard(phone, client)
+                self.track(asyncio.create_task(self._supervise_client(phone, client)))
+                await self._ensure_whitelist_initialized(phone, client)
+            except Exception:
+                self.clients.pop(phone, None)
+                raise
         except Exception as e:
             logger.error("add_account failed for %s: %s", phone, e)
             self.clients.pop(phone, None)
@@ -470,42 +515,71 @@ class SessionManager:
                 await self.database.remove(phone)
             raise
         logger.info("Account added: %s", phone)
+        audit_logger.info("account_added phone=%s", phone)
         return True
 
     async def remove_account(self, phone: str) -> bool:
-        client = self.clients.pop(phone, None)
+        """[FIX #6] Retry logout; refuse DB removal if session can't be killed."""
+        client = self.clients.get(phone)
         logged_out = False
         if client:
-            try:
-                await client(functions.auth.LogOutRequest())
-                logged_out = True
-                logger.info("Logged out bot session for %s on Telegram servers", phone)
-            except Exception as e:
-                logger.warning(
-                    "Could not log out bot session for %s (%s) — session may still "
-                    "be valid server-side; scrubbing backups anyway.",
-                    phone, e,
-                )
+            for attempt in range(3):
+                try:
+                    await client(functions.auth.LogOutRequest())
+                    logged_out = True
+                    audit_logger.info("account_logout phone=%s attempt=%d", phone, attempt + 1)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        logger.info("Logout retry for %s (attempt %d): %s", phone, attempt + 2, e)
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    logger.error("Logout FAILED for %s after retries: %s", phone, e)
+                    await _broadcast_to_admins(
+                        self.bot_app, self.config,
+                        f"⚠️ <b>Logout fail</b> for <code>{html.escape(phone)}</code>.\n"
+                        f"Session may still be active on Telegram. Try <b>Remove Account</b> again later.",
+                    )
+                    with suppress(Exception):
+                        await client.disconnect()
+                    return False
+            self.clients.pop(phone, None)
             with suppress(Exception):
                 await client.disconnect()
 
         removed = await self.database.remove(phone)
         if removed:
             await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
-            logger.info(
-                "Removed account %s (logged_out=%s, backups scrubbed)",
-                phone, logged_out,
-            )
+            audit_logger.info("account_removed phone=%s logged_out=%s", phone, logged_out)
+            logger.info("Removed account %s (logged_out=%s, backups scrubbed)", phone, logged_out)
         return removed
 
     async def toggle_anti_login(self, phone: str) -> bool:
-        record = self.database.get(phone)
-        if not record:
+        def _toggle(r: AccountRecord):
+            r.anti_login = not r.anti_login
+
+        record = await self.database.mutate(phone, _toggle)
+        if record is None:
             return False
-        record.anti_login = not record.anti_login
-        await self.database.upsert(record)
         logger.info("Anti-Login %s -> %s", phone, "ENABLED" if record.anti_login else "DISABLED")
+        audit_logger.info("anti_login_toggle phone=%s state=%s", phone, record.anti_login)
         return True
+
+    async def reset_baseline(self, phone: str) -> bool:
+        """[FEAT A] Wipe and rebuild the whitelist baseline for an account."""
+        client = self.clients.get(phone)
+        if not client:
+            return False
+
+        def _reset(r: AccountRecord):
+            r.whitelist_initialized = False
+            r.whitelisted_sessions = []
+            r.trusted_fingerprints = []
+
+        await self.database.mutate(phone, _reset)
+        ok = await self._ensure_whitelist_initialized(phone, client)
+        audit_logger.info("baseline_reset phone=%s ok=%s", phone, ok)
+        return ok
 
     async def reconnect(self, phone: str) -> bool:
         lock = self._reconnect_locks.setdefault(phone, asyncio.Lock())
@@ -527,16 +601,19 @@ class SessionManager:
                 with suppress(Exception):
                     await old_client.disconnect()
 
-            # [FIX #5] connect() + explicit auth check, no interactive start().
             client = TelegramClient(StringSession(record.session_str), self.config.api_id, self.config.api_hash)
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
                     raise AuthKeyError("session no longer authorized")
                 self.clients[phone] = client
-                self._setup_otp_guard(phone, client)
-                self.track(asyncio.create_task(self._supervise_client(phone, client)))
-                await self._ensure_whitelist_initialized(phone, client)
+                try:
+                    self._setup_otp_guard(phone, client)
+                    self.track(asyncio.create_task(self._supervise_client(phone, client)))
+                    await self._ensure_whitelist_initialized(phone, client)
+                except Exception:
+                    self.clients.pop(phone, None)
+                    raise
                 self._reconnect_delays.pop(phone, None)
                 logger.info("Reconnected: %s", phone)
                 return True
@@ -544,6 +621,7 @@ class SessionManager:
                 logger.error("Session for %s is invalid during reconnect (%s). Removing.", phone, e)
                 with suppress(Exception):
                     await client.disconnect()
+                self.clients.pop(phone, None)
                 await self.database.remove(phone)
                 await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
                 await notify_admins_session_removed(self.bot_app, self.config, phone, str(e))
@@ -630,15 +708,18 @@ class SessionManager:
         try:
             await client(functions.account.InvalidateSignInCodesRequest(codes=[code]))
             logger.warning("Login code %s for %s was invalidated.", code, phone)
+            audit_logger.warning("otp_invalidated phone=%s code=%s", phone, code)
         except Exception as e:
             logger.error("Failed to invalidate code for %s: %s", phone, e)
             return
 
-        record = self.database.get(phone)
-        if not record:
+        # [FIX #4/#10] Mutate atomically; ignore if record already removed.
+        def _inc(r: AccountRecord):
+            r.invalidated_codes += 1
+
+        record = await self.database.mutate(phone, _inc)
+        if record is None:
             return
-        record.invalidated_codes += 1
-        await self.database.upsert(record)
 
         self.track(asyncio.create_task(
             self._delayed_session_sweep(phone, delay=OTP_SESSION_SWEEP_DELAY_SECONDS, source="otp_event")
@@ -659,7 +740,7 @@ class SessionManager:
             "region": auth.region,
             "ip": auth.ip,
             "date_created": auth.date_created.isoformat() if auth.date_created else None,
-            "trusted_at": datetime.utcnow().isoformat(),
+            "trusted_at": _utcnow().isoformat(),
             "source": source,
         }
         record.whitelisted_sessions = [
@@ -670,6 +751,13 @@ class SessionManager:
         fp = _session_fingerprint(auth)
         if fp not in record.trusted_fingerprints:
             record.trusted_fingerprints.append(fp)
+
+    def _unwhitelist_session(self, record: AccountRecord, auth_hash: str, fingerprint: Optional[str]) -> None:
+        record.whitelisted_sessions = [
+            e for e in record.whitelisted_sessions if e.get("hash") != auth_hash
+        ]
+        if fingerprint and fingerprint in record.trusted_fingerprints:
+            record.trusted_fingerprints.remove(fingerprint)
 
     def _is_trusted(self, record: AccountRecord, auth) -> bool:
         if auth.current:
@@ -687,13 +775,16 @@ class SessionManager:
                 "Killed session for %s: %s / %s (%s)",
                 phone, auth.device_model, auth.platform, auth.country,
             )
+            audit_logger.warning(
+                "session_killed phone=%s device=%s platform=%s ip=%s",
+                phone, auth.device_model, auth.platform, auth.ip,
+            )
             return True
         except Exception as e:
             logger.info("Could not kill session for %s (hash=%s): %s", phone, auth.hash, e)
             return False
 
     async def _ensure_whitelist_initialized(self, phone: str, client: TelegramClient) -> bool:
-        """Returns True if the record has a valid baseline after this call."""
         record = self.database.get(phone)
         if not record:
             return False
@@ -705,15 +796,16 @@ class SessionManager:
             logger.error("Failed to fetch authorizations for baseline %s: %s", phone, e)
             return False
 
-        for auth in result.authorizations:
-            self._whitelist_session(record, auth, source="baseline")
+        def _apply(r: AccountRecord):
+            for auth in result.authorizations:
+                self._whitelist_session(r, auth, source="baseline")
+            r.whitelist_initialized = True
 
-        record.whitelist_initialized = True
-        await self.database.upsert(record)
-        logger.info(
-            "Baseline whitelist for %s: %d session(s) trusted",
-            phone, len(result.authorizations),
-        )
+        record = await self.database.mutate(phone, _apply)
+        if record is None:
+            return False
+        logger.info("Baseline whitelist for %s: %d session(s) trusted", phone, len(result.authorizations))
+        audit_logger.info("baseline_init phone=%s count=%d", phone, len(result.authorizations))
         return True
 
     async def check_sessions(self, phone: str, source: str) -> list:
@@ -722,17 +814,22 @@ class SessionManager:
         if not record or not client:
             return []
 
-        # [FIX #1] CRITICAL: never sweep without a baseline. If the baseline
-        # failed during add/connect (e.g. network blip), retry here. If it
-        # still fails, skip the sweep entirely rather than killing every
-        # legitimate device on the account.
+        # [FIX #7] Never sweep without a baseline — and tell admins if it can't init.
         if not record.whitelist_initialized:
             ok = await self._ensure_whitelist_initialized(phone, client)
             if not ok:
                 logger.warning(
-                    "Skipping session sweep for %s (%s): baseline not initialized",
-                    phone, source,
+                    "Skipping session sweep for %s (%s): baseline not initialized", phone, source,
                 )
+                await _broadcast_to_admins(
+                    self.bot_app, self.config,
+                    f"⚠️ <b>Baseline not ready</b> for <code>{html.escape(phone)}</code>\n"
+                    f"Anti-login can't sweep session (<i>{html.escape(source)}</i>).\n"
+                    f"Use the button <b>Reset Baseline</b>.",
+                )
+                return []
+            record = self.database.get(phone)
+            if not record:
                 return []
 
         try:
@@ -741,25 +838,33 @@ class SessionManager:
             logger.error("Failed to fetch authorizations for %s: %s", phone, e)
             return []
 
-        killed = []
-        changed = False
-
+        to_kill = []
+        to_trust = []
         for auth in result.authorizations:
             if self._is_trusted(record, auth):
                 if not any(e.get("hash") == auth.hash for e in record.whitelisted_sessions):
-                    self._whitelist_session(record, auth, source="fingerprint_auto")
-                    changed = True
+                    to_trust.append(auth)
                 continue
-
             if auth.current:
                 logger.error("Refusing to kill current session for %s", phone)
                 continue
+            to_kill.append(auth)
 
+        killed = []
+        for auth in to_kill:
             if await self._kill_session(client, auth, phone):
                 killed.append(auth)
 
-        if changed:
-            await self.database.upsert(record)
+        if to_trust or killed:
+            def _apply(r: AccountRecord):
+                for auth in to_trust:
+                    self._whitelist_session(r, auth, source="fingerprint_auto")
+                if killed:
+                    killed_hashes = {a.hash for a in killed}
+                    r.whitelisted_sessions = [
+                        e for e in r.whitelisted_sessions if e.get("hash") not in killed_hashes
+                    ]
+            await self.database.mutate(phone, _apply)
 
         if killed:
             await notify_admins_session_killed(self.bot_app, self.config, phone, killed, source)
@@ -854,7 +959,8 @@ async def notify_admins_session_killed(
         for auth in killed_sessions:
             fp = _session_fingerprint(auth)
             short = uuid.uuid4().hex[:10]
-            _session_manager._pending_fingerprints[short] = (phone, fp)
+            # [FIX #9] Store timestamp for TTL cleanup.
+            _session_manager._pending_fingerprints[short] = (phone, fp, time.monotonic())
             label = f"✅ Trust {auth.device_model or 'device'}"
             keyboard_rows.append([InlineKeyboardButton(label, callback_data=f"trustfp_{short}")])
 
@@ -865,17 +971,32 @@ async def notify_admins_session_killed(
 _config: Optional[Config] = None
 _session_manager: Optional[SessionManager] = None
 user_sessions: dict = {}
+_add_cooldown: dict[int, float] = {}
 
 
 def is_authorized(user_id: int) -> bool:
     return bool(_config) and user_id in _config.authorized_users
 
 
+def _check_add_cooldown(user_id: int) -> Optional[str]:
+    last = _add_cooldown.get(user_id, 0.0)
+    delta = time.monotonic() - last
+    if delta < ADD_COOLDOWN_SECONDS:
+        return f"⏳ Wait {int(ADD_COOLDOWN_SECONDS - delta + 1)} seconds before adding another account."
+    return None
+
+
+def _bump_control_message(chat_id: int, old_id: int, new_id: int):
+    """[FIX #5] Repoint sessions whose control message was recreated."""
+    for sess in user_sessions.values():
+        if sess.get("chat_id") == chat_id and sess.get("control_msg_id") == old_id:
+            sess["control_msg_id"] = new_id
+
+
 async def _safe_answer(query, text: Optional[str] = None, show_alert: bool = False):
-    # [FIX #2] Telegram allows only ONE answer per callback query. Second call
-    # raises BadRequest. We track per-query answered state via an attribute so
-    # that any branch can call this idempotently and the toast is shown exactly
-    # once with whichever text was supplied first.
+    # [FIX #2/#13] Idempotent, defensive against None.
+    if query is None:
+        return
     if getattr(query, "_safe_answered", False):
         return
     try:
@@ -888,7 +1009,9 @@ async def _safe_answer(query, text: Optional[str] = None, show_alert: bool = Fal
         logger.debug("answer() suppressed: %s", e)
 
 
-async def render(context, chat_id: int, message_id: int, text: str, keyboard=None):
+async def render(context, chat_id: int, message_id: int, text: str, keyboard=None) -> int:
+    """[FIX #5] Edit control message; if it was deleted, send a fresh one
+    and repoint any tracking session. Returns the effective message_id."""
     markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     try:
         await context.bot.edit_message_text(
@@ -898,24 +1021,36 @@ async def render(context, chat_id: int, message_id: int, text: str, keyboard=Non
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
-        return
+        return message_id
     except BadRequest as e:
-        if "message is not modified" in str(e).lower():
-            return
+        err = str(e).lower()
+        if "message is not modified" in err:
+            return message_id
+        if "message to edit not found" in err or "message can't be edited" in err:
+            logger.info("Control message %s missing; sending fresh message", message_id)
+            msg = await context.bot.send_message(
+                chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup,
+            )
+            _bump_control_message(chat_id, message_id, msg.message_id)
+            return msg.message_id
         logger.warning("HTML parse failed, retrying as plain text: %s", e)
 
-    plain = re.sub(r"<[^>]+>", "", text)
-    plain = html.unescape(plain)
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
     try:
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=plain,
-            reply_markup=markup,
+            chat_id=chat_id, message_id=message_id, text=plain, reply_markup=markup,
         )
+        return message_id
     except BadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            logger.error("Failed to edit message: %s", e)
+        err = str(e).lower()
+        if "message is not modified" in err:
+            return message_id
+        if "message to edit not found" in err or "message can't be edited" in err:
+            msg = await context.bot.send_message(chat_id, plain, reply_markup=markup)
+            _bump_control_message(chat_id, message_id, msg.message_id)
+            return msg.message_id
+        logger.error("Failed to edit message: %s", e)
+        return message_id
 
 
 def main_menu_keyboard():
@@ -925,21 +1060,35 @@ def main_menu_keyboard():
             InlineKeyboardButton("📋 Account List", callback_data="list_acc"),
         ],
         [
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
             InlineKeyboardButton("🔄 Reconnect All", callback_data="reconnect_all"),
         ],
     ]
 
 
 async def show_main_menu(context, chat_id, message_id):
-    await render(context, chat_id, message_id, "🤖 <b>Anti-Login Bot</b>\nManage your protected accounts.", main_menu_keyboard())
+    await render(
+        context, chat_id, message_id,
+        "🤖 <b>Anti-Login Bot</b>\nManage your protected accounts.",
+        main_menu_keyboard(),
+    )
 
 
-async def list_accounts_view(context, chat_id, message_id, page: int = 0):
-    # [FIX #6] Sort by phone for stable ordering across add/remove cycles.
-    accounts = sorted(_session_manager.database.all().items(), key=lambda kv: kv[0])
+def _account_sort_key(kv):
+    # [FIX #14] Put synthetic +id… identifiers last so they don't intermix.
+    phone = kv[0]
+    return (1 if phone.startswith("+id") else 0, phone)
+
+
+async def list_accounts_view(context, chat_id, message_id, page: int = 0, filter_q: str = ""):
+    accounts = sorted(_session_manager.database.all().items(), key=_account_sort_key)
+    if filter_q:
+        accounts = [(p, r) for p, r in accounts if filter_q in p]
+
     if not accounts:
         keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu")]]
-        await render(context, chat_id, message_id, "📋 <b>Account List</b>\n\nNo accounts registered yet.", keyboard)
+        msg = "📋 <b>Account List</b>\n\nNo accounts" + (f" matching <code>{html.escape(filter_q)}</code>." if filter_q else " registered yet.")
+        await render(context, chat_id, message_id, msg, keyboard)
         return
 
     total_pages = max(1, (len(accounts) + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE)
@@ -967,6 +1116,8 @@ async def list_accounts_view(context, chat_id, message_id, page: int = 0):
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu")])
 
     header = f"📋 <b>Account List</b> (page {page + 1}/{total_pages})"
+    if filter_q:
+        header += f"\n🔍 Filter: <code>{html.escape(filter_q)}</code>"
     await render(context, chat_id, message_id, header, keyboard)
 
 
@@ -976,16 +1127,19 @@ async def account_detail_view(context, chat_id, message_id, phone, banner: str =
         await list_accounts_view(context, chat_id, message_id)
         return
     status = "🔒 ENABLED" if record.anti_login else "🔓 DISABLED"
+    baseline = "✅ ready" if record.whitelist_initialized else "⚠️ not initialized"
     text = (
         f"{html.escape(banner)}📱 <b>{html.escape(phone)}</b>\n"
         f"Anti-Login status: <b>{status}</b>\n"
         f"Codes invalidated so far: {record.invalidated_codes}\n"
-        f"Whitelisted sessions: <b>{len(record.whitelisted_sessions)}</b>"
+        f"Whitelisted sessions: <b>{len(record.whitelisted_sessions)}</b>\n"
+        f"Baseline: {baseline}"
     )
     toggle_label = "🔓 Disable" if record.anti_login else "🔒 Enable"
     keyboard = [
         [InlineKeyboardButton(toggle_label, callback_data=f"toggle_{phone}")],
         [InlineKeyboardButton("🔐 Sessions", callback_data=f"sessions_{phone}")],
+        [InlineKeyboardButton("♻️ Reset Baseline", callback_data=f"resetbase_{phone}")],
         [InlineKeyboardButton("🗑 Remove Account", callback_data=f"del_{phone}")],
         [InlineKeyboardButton("🔙 Back", callback_data="list_acc")],
     ]
@@ -1026,12 +1180,13 @@ async def sessions_view(context, chat_id, message_id, phone):
 
         if not auth.current:
             short = uuid.uuid4().hex[:10]
-            _session_manager._ui_sessions[short] = (phone, auth.hash)
+            # [FIX #9] Store timestamp for TTL cleanup.
+            _session_manager._ui_sessions[short] = (phone, auth.hash, time.monotonic())
             if trusted:
                 keyboard_rows.append([
                     InlineKeyboardButton(
-                        f"🚫 Revoke {auth.device_model or 'device'}",
-                        callback_data=f"sess_revoke_{short}",
+                        f"🛡 Untrust {auth.device_model or 'device'}",
+                        callback_data=f"sess_untrust_{short}",
                     )
                 ])
             else:
@@ -1120,12 +1275,92 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id] = _new_session(message.chat_id, message.message_id)
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """[FEAT F] Escape hatch out of any pending add flow."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+    await reset_user_flow(context, user_id)
+    msg = await update.message.reply_text(
+        "✅ Dibatalkan.",
+        reply_markup=InlineKeyboardMarkup(main_menu_keyboard()),
+    )
+    user_sessions[user_id] = _new_session(msg.chat_id, msg.message_id)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """[FEAT D] /stats — quick health summary."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ Unauthorized")
+        return
+    db = _session_manager.database.all()
+    total = len(db)
+    protected = sum(1 for r in db.values() if r.anti_login)
+    codes = sum(r.invalidated_codes for r in db.values())
+    sessions = sum(len(r.whitelisted_sessions) for r in db.values())
+    fps = sum(len(r.trusted_fingerprints) for r in db.values())
+    no_baseline = sum(1 for r in db.values() if not r.whitelist_initialized)
+    connected = sum(1 for p in db if p in _session_manager.clients)
+    text = (
+        "📊 <b>Stats</b>\n"
+        f"Accounts         : <b>{total}</b>\n"
+        f"Connected        : {connected}\n"
+        f"Protected        : {protected}\n"
+        f"Codes invalid    : {codes}\n"
+        f"Whitelisted      : {sessions}\n"
+        f"Trusted FP       : {fps}\n"
+        f"⚠️ No baseline  : {no_baseline}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """[FEAT C] /search <substring> — filter accounts by phone fragment."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("⛔ Unauthorized")
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text("Usage: /search <phone fragment>")
+        return
+    matches = [
+        (p, r) for p, r in _session_manager.database.all().items()
+        if query in p
+    ]
+    if not matches:
+        await update.message.reply_text(f"No accounts matching '{query}'.")
+        return
+    lines = [f"🔍 <b>Results for '{html.escape(query)}'</b> ({len(matches)})\n"]
+    for phone, record in sorted(matches, key=_account_sort_key):
+        status = "🔒" if record.anti_login else "🔓"
+        lines.append(f"{status} <code>{html.escape(phone)}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 def generate_qr_image(url: str) -> io.BytesIO:
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, "PNG")
     buf.seek(0)
     return buf
+
+
+async def _refresh_qr_token(client, qr_login):
+    """Export a new QR token, handling LoginTokenMigrateTo.
+    May raise SessionPasswordNeededError if the account has 2FA enabled —
+    the caller (watch_qr_login) is responsible for handling that case.
+    """
+    resp = await client(functions.auth.ExportLoginTokenRequest(
+        _config.api_id, _config.api_hash, []
+    ))
+    if isinstance(resp, types.auth.LoginTokenMigrateTo):
+        await client._switch_dc(resp.dc_id)
+        resp = await client(functions.auth.ImportLoginTokenRequest(resp.token))
+        # SessionPasswordNeededError is allowed to propagate — caller handles it.
+    qr_login._resp = resp
+    return resp
 
 
 async def refresh_qr_photo(context, session: dict, qr_login) -> bool:
@@ -1240,7 +1475,19 @@ async def watch_qr_login(context, user_id):
                     await client.disconnect()
                 return
             try:
-                await qr_login.recreate()
+                await _refresh_qr_token(client, qr_login)
+            except SessionPasswordNeededError:
+                # ── FIX: 2FA aktif saat refresh QR (mis. setelah LoginTokenMigrateTo).
+                # Client tetap terhubung — kita hanya perlu input password.
+                if user_sessions.get(user_id) is session:
+                    session["step"] = "wait_password"
+                    await cleanup_qr_message(context.bot, session)
+                    await render(
+                        context, chat_id, message_id,
+                        "🔐 This account has 2FA enabled. Enter the password:",
+                        cancel_keyboard(),
+                    )
+                return
             except Exception as e:
                 logger.error("Failed to recreate QR token: %s", e)
                 await cleanup_qr_message(context.bot, session)
@@ -1265,9 +1512,6 @@ async def watch_qr_login(context, user_id):
                 await client.disconnect()
             return
 
-    # [FIX #4] get_me() can throw if the network drops right after a successful
-    # scan. Wrap it so the client is always disconnected on failure and the
-    # user is not left stuck with a dangling QR session.
     try:
         me = await client.get_me()
     except Exception as e:
@@ -1283,7 +1527,6 @@ async def watch_qr_login(context, user_id):
         )
         return
 
-    # Race guard: user navigated away while get_me was running.
     if user_sessions.get(user_id) is not session:
         with suppress(Exception):
             await client.disconnect()
@@ -1291,6 +1534,7 @@ async def watch_qr_login(context, user_id):
 
     phone = normalize_phone(me.phone) if me.phone else f"+id{me.id}"
     await cleanup_qr_message(context.bot, session)
+    _add_cooldown[user_id] = time.monotonic()
     await finish_add_account(context, chat_id, message_id, user_id, phone, client)
 
 
@@ -1299,25 +1543,33 @@ async def user_session_sweeper(bot):
         await asyncio.sleep(USER_SESSION_SWEEP_INTERVAL)
         now = time.monotonic()
         stale = []
+        # [FIX #3] Sweep stalled add-flows too (they hold live clients).
         for uid, sess in list(user_sessions.items()):
-            if "step" in sess:
-                continue
             created = sess.get("created_at", now)
-            if now - created > USER_SESSION_IDLE_TIMEOUT:
+            has_step = "step" in sess
+            timeout = STEP_TIMEOUT_SECONDS if has_step else USER_SESSION_IDLE_TIMEOUT
+            if now - created > timeout:
                 stale.append(uid)
+
         for uid in stale:
             sess = user_sessions.pop(uid, None)
             if sess:
                 await cleanup_qr_message(bot, sess)
                 await cleanup_session_client(sess)
         if stale:
-            logger.info("Swept %d idle user sessions", len(stale))
+            logger.info("Swept %d idle user session(s)", len(stale))
 
+        # [FIX #9] TTL-clean ephemeral callback maps.
         if _session_manager:
-            if len(_session_manager._ui_sessions) > 500:
-                _session_manager._ui_sessions.clear()
-            if len(_session_manager._pending_fingerprints) > 500:
-                _session_manager._pending_fingerprints.clear()
+            cutoff = time.monotonic() - UI_CACHE_TTL_SECONDS
+            _session_manager._ui_sessions = {
+                k: v for k, v in _session_manager._ui_sessions.items()
+                if len(v) >= 3 and v[2] > cutoff
+            }
+            _session_manager._pending_fingerprints = {
+                k: v for k, v in _session_manager._pending_fingerprints.items()
+                if len(v) >= 3 and v[2] > cutoff
+            }
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1345,29 +1597,53 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = session["step"]
 
     if step == "wait_phone":
-        if not PHONE_REGEX.match(text):
+        if not PHONE_REGEX.match(text) or text.startswith("+id"):
             await render(context, chat_id, message_id, "❌ Invalid format. Use <code>+&lt;country code&gt;&lt;number&gt;</code>, digits only.", cancel_keyboard())
             return
+        # [FIX #2] Connect inside try/except so failures never leak a client.
+        client = TelegramClient(StringSession(), _config.api_id, _config.api_hash)
         try:
-            client = TelegramClient(StringSession(), _config.api_id, _config.api_hash)
             await client.connect()
             await client.send_code_request(text)
-            session.update({"step": "wait_code", "phone": text, "client": client})
-            await render(context, chat_id, message_id, f"📲 Code sent to <code>{html.escape(text)}</code>.\nEnter the code:", cancel_keyboard())
         except PhoneNumberInvalidError:
+            with suppress(Exception):
+                await client.disconnect()
             await render(context, chat_id, message_id, "❌ Invalid phone number.", cancel_keyboard())
+            return
         except FloodWaitError as e:
+            with suppress(Exception):
+                await client.disconnect()
             await render(context, chat_id, message_id, f"⏳ Please wait {e.seconds} seconds and try again.", cancel_keyboard())
+            return
         except Exception as e:
+            with suppress(Exception):
+                await client.disconnect()
             await render(context, chat_id, message_id, f"❌ Error: {html.escape(str(e))}", cancel_keyboard())
+            return
+        session.update({"step": "wait_code", "phone": text, "client": client})
+        _add_cooldown[user_id] = time.monotonic()
+        await render(
+            context, chat_id, message_id,
+            f"📲 Code sent to <code>{html.escape(text)}</code>.\n"
+            "Enter the code (e.g. <code>12345</code> atau <code>1 2 3 4 5</code>):",
+            cancel_keyboard(),
+        )
 
     elif step == "wait_code":
-        if not CODE_REGEX.match(text):
-            await render(context, chat_id, message_id, "❌ The code must be numeric only. Try again:", cancel_keyboard())
+        # Strip ALL non-digit chars so "1 2 3 4 5", "1-2-3-4-5", " 12345 "
+        # and "12345" are all treated identically before validating & signing in.
+        code = re.sub(r"\D", "", text)
+        if not CODE_REGEX.match(code):
+            await render(
+                context, chat_id, message_id,
+                "❌ The code must be numeric only. Try again\n"
+                "(<code>12345</code> atau <code>1 2 3 4 5</code>):",
+                cancel_keyboard(),
+            )
             return
         phone, client = session["phone"], session["client"]
         try:
-            await client.sign_in(phone, text)
+            await client.sign_in(phone, code)
             await finish_add_account(context, chat_id, message_id, user_id, phone, client)
         except SessionPasswordNeededError:
             session["step"] = "wait_password"
@@ -1396,13 +1672,35 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except PasswordHashInvalidError:
             await render(context, chat_id, message_id, "❌ Incorrect password. Please try again:", cancel_keyboard())
         except Exception as e:
-            await render(context, chat_id, message_id, f"❌ Login failed: {html.escape(str(e))}", cancel_keyboard())
+            # [FIX #11] Clean up client on non-password errors to avoid leak.
+            logger.error("Password login failed for %s: %s", phone, e)
+            await cleanup_qr_message(context.bot, session)
+            user_sessions.pop(user_id, None)
+            with suppress(Exception):
+                await client.disconnect()
+            await render(
+                context, chat_id, message_id,
+                f"❌ Login failed: {html.escape(str(e))}",
+                [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]],
+            )
 
 
 async def finish_add_account(context, chat_id, message_id, user_id, phone, client):
-    # [FIX #3] If add_account fails (duplicate phone, DB error), the newly
-    # created Telegram session must be logged out. Plain disconnect() leaves
-    # the session valid server-side, causing orphan "bot" entries.
+    # [FIX #1] Validate the identifier before attempting to persist.
+    if not PHONE_REGEX.match(phone):
+        logger.error("Refusing to add account with invalid identifier: %r", phone)
+        with suppress(Exception):
+            await client(functions.auth.LogOutRequest())
+        with suppress(Exception):
+            await client.disconnect()
+        user_sessions.pop(user_id, None)
+        await render(
+            context, chat_id, message_id,
+            f"❌ Invalid account identifier: <code>{html.escape(phone)}</code>",
+            [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]],
+        )
+        return
+
     try:
         success = await _session_manager.add_account(phone, client)
     except Exception as e:
@@ -1447,7 +1745,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "menu":
             await show_main_menu(context, chat_id, message_id)
 
+        elif data == "stats":
+            db = _session_manager.database.all()
+            total = len(db)
+            protected = sum(1 for r in db.values() if r.anti_login)
+            codes = sum(r.invalidated_codes for r in db.values())
+            sessions_count = sum(len(r.whitelisted_sessions) for r in db.values())
+            fps = sum(len(r.trusted_fingerprints) for r in db.values())
+            no_baseline = sum(1 for r in db.values() if not r.whitelist_initialized)
+            connected = sum(1 for p in db if p in _session_manager.clients)
+            text = (
+                "📊 <b>Stats</b>\n"
+                f"Accounts         : <b>{total}</b>\n"
+                f"Connected        : {connected}\n"
+                f"Protected        : {protected}\n"
+                f"Codes invalid    : {codes}\n"
+                f"Whitelisted      : {sessions_count}\n"
+                f"Trusted FP       : {fps}\n"
+                f"⚠️ No baseline  : {no_baseline}"
+            )
+            await render(context, chat_id, message_id, text, [[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
+
         elif data == "add_acc":
+            cd = _check_add_cooldown(user_id)
+            if cd:
+                await _safe_answer(query, cd, show_alert=True)
+                await show_main_menu(context, chat_id, message_id)
+                return
             await render(context, chat_id, message_id, "Choose an account addition method:", add_method_keyboard())
 
         elif data == "add_phone":
@@ -1482,6 +1806,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _session_manager.toggle_anti_login(phone)
             await account_detail_view(context, chat_id, message_id, phone)
 
+        elif data.startswith("resetbase_"):
+            phone = data[len("resetbase_"):]
+            ok = await _session_manager.reset_baseline(phone)
+            banner = "✅ Baseline in-reset.\n\n" if ok else "❌ Reset baseline failed.\n\n"
+            await account_detail_view(context, chat_id, message_id, phone, banner=banner)
+
         elif data.startswith("delconfirm_"):
             phone = data[len("delconfirm_"):]
             ok = await _session_manager.remove_account(phone)
@@ -1494,7 +1824,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await render(
                     context, chat_id, message_id,
-                    f"⚠️ Account <code>{html.escape(phone)}</code> was not found in the database.",
+                    f"⚠️ Account <code>{html.escape(phone)}</code> could not be fully removed "
+                    f"(logout may have failed). Try again or check the log.",
                     [[InlineKeyboardButton("🔙 Back", callback_data="list_acc")]],
                 )
 
@@ -1511,11 +1842,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("sess_trust_"):
             short = data[len("sess_trust_"):]
-            key = _session_manager._ui_sessions.pop(short, None)
-            if not key:
+            entry = _session_manager._ui_sessions.pop(short, None)
+            if not entry or len(entry) < 2:
                 await _safe_answer(query, "Expired — reopen Sessions")
                 return
-            phone, hash_val = key
+            phone, hash_val = entry[0], entry[1]
             record = _session_manager.database.get(phone)
             client = _session_manager.clients.get(phone)
             if not record or not client:
@@ -1525,8 +1856,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result = await client(functions.account.GetAuthorizationsRequest())
                 for auth in result.authorizations:
                     if auth.hash == hash_val:
-                        _session_manager._whitelist_session(record, auth, source="admin_ui")
-                        await _session_manager.database.upsert(record)
+                        def _trust(r: AccountRecord):
+                            _session_manager._whitelist_session(r, auth, source="admin_ui")
+                        await _session_manager.database.mutate(phone, _trust)
+                        audit_logger.info("session_trusted_manual phone=%s hash=%s", phone, auth.hash)
                         await _safe_answer(query, "Session trusted")
                         await sessions_view(context, chat_id, message_id, phone)
                         return
@@ -1534,13 +1867,44 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error("Failed to trust session: %s", e)
             await _safe_answer(query, "Failed to trust")
 
-        elif data.startswith("sess_revoke_"):
-            short = data[len("sess_revoke_"):]
-            key = _session_manager._ui_sessions.pop(short, None)
-            if not key:
+        elif data.startswith("sess_untrust_"):
+            # [FEAT B] Remove trust from an existing whitelisted session.
+            short = data[len("sess_untrust_"):]
+            entry = _session_manager._ui_sessions.pop(short, None)
+            if not entry or len(entry) < 2:
                 await _safe_answer(query, "Expired — reopen Sessions")
                 return
-            phone, hash_val = key
+            phone, hash_val = entry[0], entry[1]
+            record = _session_manager.database.get(phone)
+            client = _session_manager.clients.get(phone)
+            if not record or not client:
+                await _safe_answer(query, "Account unavailable")
+                return
+            try:
+                result = await client(functions.account.GetAuthorizationsRequest())
+                for auth in result.authorizations:
+                    if auth.hash == hash_val:
+                        fp = _session_fingerprint(auth)
+
+                        def _untrust(r: AccountRecord):
+                            _session_manager._unwhitelist_session(r, hash_val, fp)
+
+                        await _session_manager.database.mutate(phone, _untrust)
+                        audit_logger.info("session_untrusted_manual phone=%s hash=%s", phone, hash_val)
+                        await _safe_answer(query, "Untrusted")
+                        await sessions_view(context, chat_id, message_id, phone)
+                        return
+            except Exception as e:
+                logger.error("Failed to untrust session: %s", e)
+            await _safe_answer(query, "Failed to untrust")
+
+        elif data.startswith("sess_revoke_"):
+            short = data[len("sess_revoke_"):]
+            entry = _session_manager._ui_sessions.pop(short, None)
+            if not entry or len(entry) < 2:
+                await _safe_answer(query, "Expired — reopen Sessions")
+                return
+            phone, hash_val = entry[0], entry[1]
             record = _session_manager.database.get(phone)
             client = _session_manager.clients.get(phone)
             if not record or not client:
@@ -1554,10 +1918,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await _safe_answer(query, "Refusing to revoke current session")
                             return
                         await client(functions.account.ResetAuthorizationRequest(hash=auth.hash))
-                        record.whitelisted_sessions = [
-                            e for e in record.whitelisted_sessions if e.get("hash") != auth.hash
-                        ]
-                        await _session_manager.database.upsert(record)
+
+                        def _drop(r: AccountRecord):
+                            r.whitelisted_sessions = [
+                                e for e in r.whitelisted_sessions if e.get("hash") != hash_val
+                            ]
+                        await _session_manager.database.mutate(phone, _drop)
+                        audit_logger.warning("session_revoked_manual phone=%s hash=%s", phone, hash_val)
                         logger.warning("Manually revoked session for %s", phone)
                         await _safe_answer(query, "Revoked")
                         await sessions_view(context, chat_id, message_id, phone)
@@ -1569,17 +1936,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("trustfp_"):
             short = data[len("trustfp_"):]
             entry = _session_manager._pending_fingerprints.pop(short, None)
-            if not entry:
+            if not entry or len(entry) < 2:
                 await _safe_answer(query, "Expired")
                 return
-            phone, fp = entry
-            record = _session_manager.database.get(phone)
-            if not record:
+            phone, fp = entry[0], entry[1]
+
+            def _trust_fp(r: AccountRecord):
+                if fp not in r.trusted_fingerprints:
+                    r.trusted_fingerprints.append(fp)
+
+            record = await _session_manager.database.mutate(phone, _trust_fp)
+            if record is None:
                 await _safe_answer(query, "Account not found")
                 return
-            if fp not in record.trusted_fingerprints:
-                record.trusted_fingerprints.append(fp)
-                await _session_manager.database.upsert(record)
+            audit_logger.info("fingerprint_trusted phone=%s fp=%s", phone, fp)
             await _safe_answer(query, "Device trusted — user can now re-login")
             with suppress(Exception):
                 await query.edit_message_text(
@@ -1588,9 +1958,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.HTML,
                 )
     finally:
-        # [FIX #2] Ensure the callback query is always answered, even if the
-        # branch above returned without answering explicitly. Any explicit
-        # answer earlier already set the flag, so this is a no-op in that case.
+        # [FIX #2] Always answer exactly once.
         await _safe_answer(query)
 
 
@@ -1652,6 +2020,9 @@ def main():
     session_manager.bot_app = bot_app
 
     bot_app.add_handler(CommandHandler("start", start_command))
+    bot_app.add_handler(CommandHandler("cancel", cancel_command))
+    bot_app.add_handler(CommandHandler("stats", stats_command))
+    bot_app.add_handler(CommandHandler("search", search_command))
     bot_app.add_handler(CallbackQueryHandler(button_callback))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     bot_app.add_error_handler(error_handler)
