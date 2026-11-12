@@ -1182,20 +1182,24 @@ async def sessions_view(context, chat_id, message_id, phone):
             short = uuid.uuid4().hex[:10]
             # [FIX #9] Store timestamp for TTL cleanup.
             _session_manager._ui_sessions[short] = (phone, auth.hash, time.monotonic())
+            device = auth.device_model or "device"
             if trusted:
-                keyboard_rows.append([
-                    InlineKeyboardButton(
-                        f"🛡 Untrust {auth.device_model or 'device'}",
-                        callback_data=f"sess_untrust_{short}",
-                    )
-                ])
+                action_btn = InlineKeyboardButton(
+                    f"🛡 Untrust {device}",
+                    callback_data=f"sess_untrust_{short}",
+                )
             else:
-                keyboard_rows.append([
-                    InlineKeyboardButton(
-                        f"✅ Trust {auth.device_model or 'device'}",
-                        callback_data=f"sess_trust_{short}",
-                    )
-                ])
+                action_btn = InlineKeyboardButton(
+                    f"✅ Trust {device}",
+                    callback_data=f"sess_trust_{short}",
+                )
+            keyboard_rows.append([
+                action_btn,
+                InlineKeyboardButton(
+                    "🔪 Logout",
+                    callback_data=f"revokeconfirm_{short}",
+                ),
+            ])
 
     keyboard_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"sessions_{phone}")])
     keyboard_rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}")])
@@ -1282,7 +1286,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await reset_user_flow(context, user_id)
     msg = await update.message.reply_text(
-        "✅ Dibatalkan.",
+        "✅ Canceled.",
         reply_markup=InlineKeyboardMarkup(main_menu_keyboard()),
     )
     user_sessions[user_id] = _new_session(msg.chat_id, msg.message_id)
@@ -1625,7 +1629,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render(
             context, chat_id, message_id,
             f"📲 Code sent to <code>{html.escape(text)}</code>.\n"
-            "Enter the code (e.g. <code>12345</code> atau <code>1 2 3 4 5</code>):",
+            "Enter the code (e.g. <code>12345</code> or <code>1 2 3 4 5</code>):",
             cancel_keyboard(),
         )
 
@@ -1637,7 +1641,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render(
                 context, chat_id, message_id,
                 "❌ The code must be numeric only. Try again\n"
-                "(<code>12345</code> atau <code>1 2 3 4 5</code>):",
+                "(<code>12345</code> or <code>1 2 3 4 5</code>):",
                 cancel_keyboard(),
             )
             return
@@ -1897,6 +1901,53 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error("Failed to untrust session: %s", e)
             await _safe_answer(query, "Failed to untrust")
+
+        elif data.startswith("revokeconfirm_"):
+            # Confirmation step before logout — destructive action, cannot be undone.
+            short = data[len("revokeconfirm_"):]
+            entry = _session_manager._ui_sessions.get(short)
+            if not entry or len(entry) < 2:
+                await _safe_answer(query, "Expired — reopen Sessions")
+                return
+            phone, hash_val = entry[0], entry[1]
+            client = _session_manager.clients.get(phone)
+            if not client:
+                await _safe_answer(query, "Account unavailable")
+                return
+
+            # Fetch session details so the user knows which device will be logged out.
+            try:
+                result = await client(functions.account.GetAuthorizationsRequest())
+            except Exception as e:
+                logger.error("Failed to load session for revoke-confirm: %s", e)
+                await _safe_answer(query, "Failed to load session")
+                return
+
+            target = next(
+                (a for a in result.authorizations if a.hash == hash_val),
+                None,
+            )
+            if target is None:
+                await _safe_answer(query, "Session not found")
+                return
+            if target.current:
+                await _safe_answer(query, "Refusing to logout current session")
+                return
+
+            keyboard = [[
+                InlineKeyboardButton("✅ Yes, Logout", callback_data=f"sess_revoke_{short}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"sessions_{phone}"),
+            ]]
+            await render(
+                context, chat_id, message_id,
+                f"⚠️ <b>Logout this session?</b>\n\n"
+                f"Account: <code>{html.escape(phone)}</code>\n\n"
+                f"{_format_session(target)}"
+                f"\nThis session will be <b>terminated immediately on Telegram's servers</b>.\n"
+                f"The device will need to log in again.\n\n"
+                f"<b>This action cannot be undone.</b>",
+                keyboard,
+            )
 
         elif data.startswith("sess_revoke_"):
             short = data[len("sess_revoke_"):]
