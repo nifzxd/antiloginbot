@@ -35,7 +35,7 @@ from telethon.sessions import StringSession
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -59,20 +59,47 @@ def _utcnow() -> datetime:
 # [FIX #1] Accept +id... identifiers (QR accounts without phone).
 PHONE_REGEX = re.compile(r"^(?:\+\d{7,15}|\+id\d+)$")
 CODE_REGEX = re.compile(r"^\d{4,7}$")
-OTP_CODE_REGEX = re.compile(r"\b\d{5}\b")
+
+# [VALID #1] OTP extraction — structured keyword match first, then
+# single-candidate fallback. Supports 5-6 digit codes (Telegram now
+# uses both, and some locales already use 6 digits).
+OTP_CODE_KEYWORD_RE = re.compile(
+    r"(?i)(?:login code|kode|verifikasi|verification code|code)[^\d]{0,30}(\d{5,6})"
+)
+OTP_CODE_ANY_RE = re.compile(r"\b\d{5,6}\b")
+
 TELEGRAM_SERVICE_ID = 777000
 QR_MAX_REFRESHES = 6
 HEALTH_CHECK_INTERVAL_SECONDS = 300
-BACKUP_RETENTION_COUNT = 5
+BACKUP_RETENTION_COUNT = 1
 BACKUP_MIN_INTERVAL_SECONDS = 60
 USER_SESSION_SWEEP_INTERVAL = 3600
 USER_SESSION_IDLE_TIMEOUT = 3600
-STEP_TIMEOUT_SECONDS = 900           # [FIX #3] sweep stalled add-account flows
-ACCOUNTS_PER_PAGE = 20
+STEP_TIMEOUT_SECONDS = 900
+ACCOUNTS_PER_PAGE = 10
 OTP_SESSION_SWEEP_DELAY_SECONDS = 4
-ADD_COOLDOWN_SECONDS = 120           # [FEAT E] per-user add-account cooldown
-UI_CACHE_TTL_SECONDS = 1800          # [FIX #9] TTL for ephemeral UI maps
+ADD_COOLDOWN_SECONDS = 120
+UI_CACHE_TTL_SECONDS = 1800
 INVALID_SESSION_ERRORS = (AuthKeyError, UserDeactivatedError, UserDeactivatedBanError)
+
+
+def _extract_otp_code(text: str) -> Optional[str]:
+    """[VALID #1] Extract the OTP from a Telegram service message.
+    Returns None if the message is ambiguous or has no candidate."""
+    if not text:
+        return None
+    m = OTP_CODE_KEYWORD_RE.search(text)
+    if m:
+        return m.group(1)
+    candidates = OTP_CODE_ANY_RE.findall(text)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        logger.warning(
+            "OTP message ambiguous (%d candidates), skipping: %r",
+            len(candidates), text[:200],
+        )
+    return None
 
 
 class ConsoleFormatter(logging.Formatter):
@@ -111,7 +138,6 @@ def setup_logging() -> logging.Logger:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("telethon").setLevel(logging.WARNING)
 
-    # [FEAT G] Audit log — dedicated, non-propagating file logger.
     audit = logging.getLogger("audit")
     audit_path = Path(LOG_DIR) / "audit.log"
     if not any(
@@ -136,19 +162,16 @@ class Config:
     api_id: int
     api_hash: str
     bot_token: str
-    forward_channel: Optional[str]
     admin_ids: frozenset
-    allowed_users: frozenset
-    trust_fingerprint: bool = True
-
-    @property
-    def authorized_users(self) -> frozenset:
-        return self.admin_ids | self.allowed_users
 
 
 def _to_int_set(values) -> frozenset:
     result = set()
     for value in values or []:
+        # [VALID #6] Reject bools (True/False are ints in Python).
+        if isinstance(value, bool):
+            logger.warning("Ignoring bool id in config.json: %r", value)
+            continue
         try:
             result.add(int(value))
         except (TypeError, ValueError):
@@ -162,10 +185,7 @@ def load_config(path: Path) -> Optional[Config]:
             "api_id": 123456,
             "api_hash": "your_hash",
             "bot_token": "your_token",
-            "forward_channel": "@channel",
             "admin_ids": [123456789],
-            "allowed_users": [],
-            "trust_fingerprint": True,
         }
         path.write_text(json.dumps(sample, indent=2))
         logger.warning("%s not found. A sample has been created — fill it in and restart.", path)
@@ -177,45 +197,55 @@ def load_config(path: Path) -> Optional[Config]:
         logger.error("Failed to read %s: %s", path, e)
         return None
 
+    if not isinstance(raw, dict):
+        logger.error("config.json must be a JSON object")
+        return None
+
+    # [VALID #6] api_id validation
+    raw_api_id = raw.get("api_id")
+    if isinstance(raw_api_id, bool):
+        logger.error("api_id must be an integer, not bool")
+        return None
     try:
-        api_id = int(raw.get("api_id", 0))
+        api_id = int(raw_api_id)
     except (TypeError, ValueError):
-        api_id = 0
+        logger.error("api_id must be an integer, got %r", raw_api_id)
+        return None
+    if not (1 <= api_id <= 10_000_000_000):
+        logger.error("api_id out of plausible range: %s", api_id)
+        return None
 
+    # [VALID #6] api_hash validation
     api_hash = raw.get("api_hash")
-    bot_token = raw.get("bot_token")
-    forward_channel = raw.get("forward_channel") or None
-    trust_fingerprint = bool(raw.get("trust_fingerprint", True))
+    if not isinstance(api_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash):
+        logger.error("api_hash must be a 32-char hex string")
+        return None
+    if "your_hash" in api_hash.lower():
+        logger.error("api_hash still sample value — change it first")
+        return None
 
-    if not api_id or not api_hash or not bot_token:
-        logger.error("api_id, api_hash and bot_token are required in config.json")
+    # [VALID #6] bot_token validation
+    bot_token = raw.get("bot_token")
+    if not isinstance(bot_token, str) or not re.fullmatch(r"\d+:[A-Za-z0-9_-]{30,50}", bot_token):
+        logger.error("bot_token format invalid (expected '<id>:<secret>')")
+        return None
+    if "your_token" in bot_token.lower():
+        logger.error("bot_token still sample value — change it first")
         return None
 
     return Config(
         api_id=api_id,
         api_hash=api_hash,
         bot_token=bot_token,
-        forward_channel=forward_channel,
         admin_ids=_to_int_set(raw.get("admin_ids")),
-        allowed_users=_to_int_set(raw.get("allowed_users")),
-        trust_fingerprint=trust_fingerprint,
     )
 
 
-def mask_phone(phone: str) -> str:
-    if phone.startswith("+id"):
-        return "+id***" + phone[-3:] if len(phone) > 6 else phone
-    digits = phone.lstrip("+")
-    if len(digits) <= 6:
-        return "+" + digits[0] + "*" * (len(digits) - 1)
-    visible_start, visible_end = 3, 2
-    masked = "*" * (len(digits) - visible_start - visible_end)
-    return f"+{digits[:visible_start]}{masked}{digits[-visible_end:]}"
-
-
 def normalize_phone(raw: str) -> str:
-    digits = re.sub(r"\D", "", raw)
-    return "+" + digits
+    # [VALID #8] Preserve +id... identifiers
+    if raw.startswith("+id"):
+        return raw
+    return "+" + re.sub(r"\D", "", raw)
 
 
 @dataclasses.dataclass
@@ -227,7 +257,6 @@ class AccountRecord:
     updated_at: str = dataclasses.field(default_factory=lambda: _utcnow().isoformat())
     invalidated_codes: int = 0
     whitelisted_sessions: list = dataclasses.field(default_factory=list)
-    trusted_fingerprints: list = dataclasses.field(default_factory=list)
     whitelist_initialized: bool = False
 
     def touch(self):
@@ -246,24 +275,32 @@ class AccountRecord:
             updated_at=str(data.get("updated_at") or _utcnow().isoformat()),
             invalidated_codes=int(data.get("invalidated_codes", 0) or 0),
             whitelisted_sessions=list(data.get("whitelisted_sessions", []) or []),
-            trusted_fingerprints=list(data.get("trusted_fingerprints", []) or []),
             whitelist_initialized=bool(data.get("whitelist_initialized", False)),
         )
 
 
 def validate_account_record(phone: str, data) -> Optional[str]:
+    # [VALID #2] + [VALID #12] Full record validation — prevents load() crash
     if not PHONE_REGEX.match(phone):
         return f"invalid phone format: {phone}"
     if not isinstance(data, dict):
         return "record is not a JSON object"
     session_str = data.get("session_str")
-    if not session_str or not isinstance(session_str, str):
+    if not isinstance(session_str, str) or not session_str.strip():
         return "missing or empty session_str"
+    # [VALID #2] Ensure invalidated_codes is numeric
+    try:
+        int(data.get("invalidated_codes", 0) or 0)
+    except (TypeError, ValueError):
+        return "invalidated_codes is not numeric"
+    # [VALID #2] Ensure whitelisted_sessions is a list
+    if not isinstance(data.get("whitelisted_sessions", []), list):
+        return "whitelisted_sessions is not a list"
+    if not isinstance(data.get("anti_login", False), bool):
+        return "anti_login is not a bool"
+    if not isinstance(data.get("whitelist_initialized", False), bool):
+        return "whitelist_initialized is not a bool"
     return None
-
-
-def _session_fingerprint(auth) -> str:
-    return f"{auth.device_model or '?'}|{auth.platform or '?'}|{auth.app_name or '?'}"
 
 
 def _format_session(auth, prefix: str = "") -> str:
@@ -299,7 +336,12 @@ class AccountDatabase:
                 logger.warning("Rejecting corrupt account record %s: %s", phone, error)
                 rejected.append(phone)
                 continue
-            records[phone] = AccountRecord.from_dict(phone, data)
+            try:
+                records[phone] = AccountRecord.from_dict(phone, data)
+            except Exception as e:
+                # [VALID #2] Never let a single bad record crash startup
+                logger.error("Failed to parse record %s: %s", phone, e)
+                rejected.append(phone)
         self._records = records
 
         if rejected:
@@ -316,7 +358,10 @@ class AccountDatabase:
             content = self.path.read_text(encoding="utf-8")
             if not content.strip():
                 return {}
-            return json.loads(content)
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise json.JSONDecodeError("top-level is not an object", content, 0)
+            return data
         except (json.JSONDecodeError, OSError) as e:
             logger.error("accounts.json is corrupt (%s). Attempting recovery from backup.", e)
             return self._recover_from_backup()
@@ -326,6 +371,13 @@ class AccountDatabase:
         for backup in backups:
             try:
                 data = json.loads(backup.read_text(encoding="utf-8"))
+                # [VALID #16] Validate structure before accepting backup
+                if not isinstance(data, dict):
+                    logger.warning("Backup %s is not a dict, skip", backup.name)
+                    continue
+                if not all(PHONE_REGEX.match(k) for k in data.keys() if isinstance(k, str)):
+                    logger.warning("Backup %s has invalid keys, skip", backup.name)
+                    continue
                 logger.warning("Recovered account database from backup: %s", backup.name)
                 return data
             except (json.JSONDecodeError, OSError):
@@ -349,7 +401,6 @@ class AccountDatabase:
             await self._save_locked()
 
     async def mutate(self, phone: str, fn) -> Optional[AccountRecord]:
-        """[FIX #4] In-place mutation that NEVER re-creates a deleted record."""
         async with self._lock:
             record = self._records.get(phone)
             if record is None:
@@ -373,6 +424,10 @@ class AccountDatabase:
         for backup in self.backup_dir.glob("accounts_*.json"):
             try:
                 data = json.loads(backup.read_text(encoding="utf-8"))
+                # [VALID #10] Guard against non-dict backups
+                if not isinstance(data, dict):
+                    logger.warning("Backup %s not a dict, skip redact", backup.name)
+                    continue
                 if phone in data:
                     del data[phone]
                     backup.write_text(
@@ -424,9 +479,7 @@ class SessionManager:
         self._reconnect_delays: dict[str, float] = {}
         self._reconnect_locks: dict[str, asyncio.Lock] = {}
         self._guarded_clients: weakref.WeakSet = weakref.WeakSet()
-        # [FIX #9] Store (phone, data, created_monotonic) so we can TTL them.
         self._ui_sessions: dict[str, tuple] = {}
-        self._pending_fingerprints: dict[str, tuple] = {}
 
     def is_protected(self, phone: str) -> bool:
         record = self.database.get(phone)
@@ -455,14 +508,24 @@ class SessionManager:
             await asyncio.gather(*(connect(p, r) for p, r in records))
 
     async def _connect_existing(self, phone: str, record: AccountRecord):
-        client = TelegramClient(StringSession(record.session_str), self.config.api_id, self.config.api_hash)
+        # [VALID #11] Detect corrupt session_str early
+        try:
+            session = StringSession(record.session_str)
+        except (ValueError, TypeError) as e:
+            logger.error("Corrupt session_str for %s (%s). Removing.", phone, e)
+            await self.database.remove(phone)
+            await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
+            return
+
+        client = TelegramClient(session, self.config.api_id, self.config.api_hash)
         try:
             await client.connect()
             if not await client.is_user_authorized():
                 raise AuthKeyError("session no longer authorized")
+            # [VALID #5] Guard against get_me() returning None
             me = await client.get_me()
-            # [FIX #8] Register client AFTER setup succeeds, so a failure here
-            # never leaves a disconnected-but-registered entry.
+            if me is None:
+                raise AuthKeyError("get_me returned None — session likely invalid")
             self.clients[phone] = client
             try:
                 self._setup_otp_guard(phone, client)
@@ -519,7 +582,6 @@ class SessionManager:
         return True
 
     async def remove_account(self, phone: str) -> bool:
-        """[FIX #6] Retry logout; refuse DB removal if session can't be killed."""
         client = self.clients.get(phone)
         logged_out = False
         if client:
@@ -566,7 +628,6 @@ class SessionManager:
         return True
 
     async def reset_baseline(self, phone: str) -> bool:
-        """[FEAT A] Wipe and rebuild the whitelist baseline for an account."""
         client = self.clients.get(phone)
         if not client:
             return False
@@ -574,7 +635,6 @@ class SessionManager:
         def _reset(r: AccountRecord):
             r.whitelist_initialized = False
             r.whitelisted_sessions = []
-            r.trusted_fingerprints = []
 
         await self.database.mutate(phone, _reset)
         ok = await self._ensure_whitelist_initialized(phone, client)
@@ -601,11 +661,24 @@ class SessionManager:
                 with suppress(Exception):
                     await old_client.disconnect()
 
-            client = TelegramClient(StringSession(record.session_str), self.config.api_id, self.config.api_hash)
+            # [VALID #11] Detect corrupt session_str early
+            try:
+                session = StringSession(record.session_str)
+            except (ValueError, TypeError) as e:
+                logger.error("Corrupt session_str for %s during reconnect (%s). Removing.", phone, e)
+                await self.database.remove(phone)
+                await asyncio.to_thread(self.database.redact_phone_from_backups, phone)
+                return False
+
+            client = TelegramClient(session, self.config.api_id, self.config.api_hash)
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
                     raise AuthKeyError("session no longer authorized")
+                # [VALID #5] Guard get_me() None
+                me = await client.get_me()
+                if me is None:
+                    raise AuthKeyError("get_me returned None — session likely invalid")
                 self.clients[phone] = client
                 try:
                     self._setup_otp_guard(phone, client)
@@ -698,10 +771,10 @@ class SessionManager:
     async def _handle_otp_event(self, phone: str, event):
         if not self.is_protected(phone):
             return
-        match = OTP_CODE_REGEX.search(event.message.text or "")
-        if not match:
+        # [VALID #1] Use robust extraction; skip ambiguous messages
+        code = _extract_otp_code(event.message.text or "")
+        if not code:
             return
-        code = match.group(0)
         client = self.clients.get(phone)
         if not client:
             return
@@ -713,7 +786,6 @@ class SessionManager:
             logger.error("Failed to invalidate code for %s: %s", phone, e)
             return
 
-        # [FIX #4/#10] Mutate atomically; ignore if record already removed.
         def _inc(r: AccountRecord):
             r.invalidated_codes += 1
 
@@ -725,8 +797,6 @@ class SessionManager:
             self._delayed_session_sweep(phone, delay=OTP_SESSION_SWEEP_DELAY_SECONDS, source="otp_event")
         ))
 
-        if self.config.forward_channel:
-            await post_alert_to_channel(self.bot_app, self.config, phone)
         await notify_admins_login_attempt(self.bot_app, self.config, phone)
 
     def _whitelist_session(self, record: AccountRecord, auth, source: str = "manual") -> None:
@@ -748,25 +818,10 @@ class SessionManager:
         ]
         record.whitelisted_sessions.append(entry)
 
-        fp = _session_fingerprint(auth)
-        if fp not in record.trusted_fingerprints:
-            record.trusted_fingerprints.append(fp)
-
-    def _unwhitelist_session(self, record: AccountRecord, auth_hash: str, fingerprint: Optional[str]) -> None:
-        record.whitelisted_sessions = [
-            e for e in record.whitelisted_sessions if e.get("hash") != auth_hash
-        ]
-        if fingerprint and fingerprint in record.trusted_fingerprints:
-            record.trusted_fingerprints.remove(fingerprint)
-
     def _is_trusted(self, record: AccountRecord, auth) -> bool:
         if auth.current:
             return True
-        if any(e.get("hash") == auth.hash for e in record.whitelisted_sessions):
-            return True
-        if self.config.trust_fingerprint and _session_fingerprint(auth) in record.trusted_fingerprints:
-            return True
-        return False
+        return any(e.get("hash") == auth.hash for e in record.whitelisted_sessions)
 
     async def _kill_session(self, client, auth, phone: str) -> bool:
         try:
@@ -814,7 +869,6 @@ class SessionManager:
         if not record or not client:
             return []
 
-        # [FIX #7] Never sweep without a baseline — and tell admins if it can't init.
         if not record.whitelist_initialized:
             ok = await self._ensure_whitelist_initialized(phone, client)
             if not ok:
@@ -839,11 +893,8 @@ class SessionManager:
             return []
 
         to_kill = []
-        to_trust = []
         for auth in result.authorizations:
             if self._is_trusted(record, auth):
-                if not any(e.get("hash") == auth.hash for e in record.whitelisted_sessions):
-                    to_trust.append(auth)
                 continue
             if auth.current:
                 logger.error("Refusing to kill current session for %s", phone)
@@ -855,18 +906,13 @@ class SessionManager:
             if await self._kill_session(client, auth, phone):
                 killed.append(auth)
 
-        if to_trust or killed:
-            def _apply(r: AccountRecord):
-                for auth in to_trust:
-                    self._whitelist_session(r, auth, source="fingerprint_auto")
-                if killed:
-                    killed_hashes = {a.hash for a in killed}
-                    r.whitelisted_sessions = [
-                        e for e in r.whitelisted_sessions if e.get("hash") not in killed_hashes
-                    ]
-            await self.database.mutate(phone, _apply)
-
         if killed:
+            def _apply(r: AccountRecord):
+                killed_hashes = {a.hash for a in killed}
+                r.whitelisted_sessions = [
+                    e for e in r.whitelisted_sessions if e.get("hash") not in killed_hashes
+                ]
+            await self.database.mutate(phone, _apply)
             await notify_admins_session_killed(self.bot_app, self.config, phone, killed, source)
 
         return killed
@@ -888,21 +934,6 @@ class SessionManager:
                 await client.disconnect()
         self.clients.clear()
         logger.info("All account connections closed.")
-
-
-async def post_alert_to_channel(bot_app: Optional[Application], config: Config, phone: str):
-    if not bot_app or not config.forward_channel:
-        return
-    text = (
-        "⚠️ Unauthorized login attempt detected\n"
-        f"Account: {mask_phone(phone)}\n"
-        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        "The login code was automatically invalidated."
-    )
-    try:
-        await bot_app.bot.send_message(config.forward_channel, text)
-    except Exception as e:
-        logger.error("Failed to post alert to channel: %s", e)
 
 
 async def _broadcast_to_admins(bot_app: Optional[Application], config: Config, text: str, markup=None):
@@ -954,18 +985,7 @@ async def notify_admins_session_killed(
     for auth in killed_sessions:
         lines.append(_format_session(auth, prefix="• "))
 
-    keyboard_rows = []
-    if _session_manager:
-        for auth in killed_sessions:
-            fp = _session_fingerprint(auth)
-            short = uuid.uuid4().hex[:10]
-            # [FIX #9] Store timestamp for TTL cleanup.
-            _session_manager._pending_fingerprints[short] = (phone, fp, time.monotonic())
-            label = f"✅ Trust {auth.device_model or 'device'}"
-            keyboard_rows.append([InlineKeyboardButton(label, callback_data=f"trustfp_{short}")])
-
-    markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
-    await _broadcast_to_admins(bot_app, config, "\n".join(lines), markup=markup)
+    await _broadcast_to_admins(bot_app, config, "\n".join(lines))
 
 
 _config: Optional[Config] = None
@@ -975,7 +995,7 @@ _add_cooldown: dict[int, float] = {}
 
 
 def is_authorized(user_id: int) -> bool:
-    return bool(_config) and user_id in _config.authorized_users
+    return bool(_config) and user_id in _config.admin_ids
 
 
 def _check_add_cooldown(user_id: int) -> Optional[str]:
@@ -987,14 +1007,12 @@ def _check_add_cooldown(user_id: int) -> Optional[str]:
 
 
 def _bump_control_message(chat_id: int, old_id: int, new_id: int):
-    """[FIX #5] Repoint sessions whose control message was recreated."""
     for sess in user_sessions.values():
         if sess.get("chat_id") == chat_id and sess.get("control_msg_id") == old_id:
             sess["control_msg_id"] = new_id
 
 
 async def _safe_answer(query, text: Optional[str] = None, show_alert: bool = False):
-    # [FIX #2/#13] Idempotent, defensive against None.
     if query is None:
         return
     if getattr(query, "_safe_answered", False):
@@ -1005,13 +1023,27 @@ async def _safe_answer(query, text: Optional[str] = None, show_alert: bool = Fal
         pass
     try:
         await query.answer(text=text, show_alert=show_alert)
-    except BadRequest as e:
+    except (BadRequest, TimedOut, NetworkError) as e:
         logger.debug("answer() suppressed: %s", e)
 
 
+def _validate_keyboard(keyboard) -> None:
+    """[VALID #13] Warn if any callback_data exceeds Telegram's 64-byte limit."""
+    if not keyboard:
+        return
+    for row in keyboard:
+        for btn in row:
+            cb = getattr(btn, "callback_data", None)
+            if isinstance(cb, str):
+                encoded = cb.encode("utf-8")
+                if len(encoded) > 64:
+                    logger.error(
+                        "callback_data exceeds 64 bytes (%d): %r", len(encoded), cb,
+                    )
+
+
 async def render(context, chat_id: int, message_id: int, text: str, keyboard=None) -> int:
-    """[FIX #5] Edit control message; if it was deleted, send a fresh one
-    and repoint any tracking session. Returns the effective message_id."""
+    _validate_keyboard(keyboard)
     markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     try:
         await context.bot.edit_message_text(
@@ -1056,12 +1088,12 @@ async def render(context, chat_id: int, message_id: int, text: str, keyboard=Non
 def main_menu_keyboard():
     return [
         [
-            InlineKeyboardButton("➕ Add Account", callback_data="add_acc"),
-            InlineKeyboardButton("📋 Account List", callback_data="list_acc"),
+            InlineKeyboardButton("➕ Add Account", callback_data="add_acc", style="primary"),
+            InlineKeyboardButton("📋 Account List", callback_data="list_acc", style="success"),
         ],
         [
-            InlineKeyboardButton("📊 Stats", callback_data="stats"),
-            InlineKeyboardButton("🔄 Reconnect All", callback_data="reconnect_all"),
+            InlineKeyboardButton("📊 Stats", callback_data="stats", style="primary"),
+            InlineKeyboardButton("🔄 Reconnect All", callback_data="reconnect_all", style="danger"),
         ],
     ]
 
@@ -1069,13 +1101,12 @@ def main_menu_keyboard():
 async def show_main_menu(context, chat_id, message_id):
     await render(
         context, chat_id, message_id,
-        "🤖 <b>Anti-Login Bot</b>\nManage your protected accounts.",
+        "🛡️ <b>Welcome to Anti-Login Bot</b>\nSecurely manage and monitor your protected accounts.\n\n👨‍💻 Developer: @nifzz",
         main_menu_keyboard(),
     )
 
 
 def _account_sort_key(kv):
-    # [FIX #14] Put synthetic +id… identifiers last so they don't intermix.
     phone = kv[0]
     return (1 if phone.startswith("+id") else 0, phone)
 
@@ -1086,7 +1117,7 @@ async def list_accounts_view(context, chat_id, message_id, page: int = 0, filter
         accounts = [(p, r) for p, r in accounts if filter_q in p]
 
     if not accounts:
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu")]]
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu", style="primary")]]
         msg = "📋 <b>Account List</b>\n\nNo accounts" + (f" matching <code>{html.escape(filter_q)}</code>." if filter_q else " registered yet.")
         await render(context, chat_id, message_id, msg, keyboard)
         return
@@ -1103,17 +1134,18 @@ async def list_accounts_view(context, chat_id, message_id, page: int = 0, filter
             InlineKeyboardButton(
                 f"{'🔒' if record.anti_login else '🔓'} {phone}",
                 callback_data=f"acc_{phone}",
+                style="success" if record.anti_login else "danger",
             )
         ])
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_acc_{page - 1}"))
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_acc_{page - 1}", style="primary"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"list_acc_{page + 1}"))
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"list_acc_{page + 1}", style="primary"))
     if nav_row:
         keyboard.append(nav_row)
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu", style="primary")])
 
     header = f"📋 <b>Account List</b> (page {page + 1}/{total_pages})"
     if filter_q:
@@ -1136,17 +1168,18 @@ async def account_detail_view(context, chat_id, message_id, phone, banner: str =
         f"Baseline: {baseline}"
     )
     toggle_label = "🔓 Disable" if record.anti_login else "🔒 Enable"
+    toggle_style = "danger" if record.anti_login else "success"
     keyboard = [
-        [InlineKeyboardButton(toggle_label, callback_data=f"toggle_{phone}")],
-        [InlineKeyboardButton("🔐 Sessions", callback_data=f"sessions_{phone}")],
-        [InlineKeyboardButton("♻️ Reset Baseline", callback_data=f"resetbase_{phone}")],
-        [InlineKeyboardButton("🗑 Remove Account", callback_data=f"del_{phone}")],
-        [InlineKeyboardButton("🔙 Back", callback_data="list_acc")],
+        [InlineKeyboardButton(toggle_label, callback_data=f"toggle_{phone}", style=toggle_style)],
+        [InlineKeyboardButton("🔐 Sessions", callback_data=f"sessions_{phone}", style="primary")],
+        [InlineKeyboardButton("♻️ Reset Baseline", callback_data=f"resetbase_{phone}", style="primary")],
+        [InlineKeyboardButton("🗑 Remove Account", callback_data=f"del_{phone}", style="danger")],
+        [InlineKeyboardButton("🔙 Back", callback_data="list_acc", style="primary")],
     ]
     await render(context, chat_id, message_id, text, keyboard)
 
 
-async def sessions_view(context, chat_id, message_id, phone):
+async def sessions_view(context, chat_id, message_id, phone, banner: str = ""):
     record = _session_manager.database.get(phone)
     client = _session_manager.clients.get(phone)
     if not record:
@@ -1155,8 +1188,8 @@ async def sessions_view(context, chat_id, message_id, phone):
     if not client:
         await render(
             context, chat_id, message_id,
-            f"⚠️ Client for <code>{html.escape(phone)}</code> is not connected.",
-            [[InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}")]],
+            f"{banner}⚠️ Client for <code>{html.escape(phone)}</code> is not connected.",
+            [[InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}", style="primary")]],
         )
         return
 
@@ -1165,12 +1198,12 @@ async def sessions_view(context, chat_id, message_id, phone):
     except Exception as e:
         await render(
             context, chat_id, message_id,
-            f"❌ Failed to fetch sessions: {html.escape(str(e))}",
-            [[InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}")]],
+            f"{banner}❌ Failed to fetch sessions: {html.escape(str(e))}",
+            [[InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}", style="primary")]],
         )
         return
 
-    lines = [f"🔐 <b>Sessions for {html.escape(phone)}</b>\n"]
+    lines = [f"{banner}🔐 <b>Sessions for {html.escape(phone)}</b>\n"]
     keyboard_rows = []
     for auth in result.authorizations:
         trusted = _session_manager._is_trusted(record, auth)
@@ -1180,29 +1213,24 @@ async def sessions_view(context, chat_id, message_id, phone):
 
         if not auth.current:
             short = uuid.uuid4().hex[:10]
-            # [FIX #9] Store timestamp for TTL cleanup.
             _session_manager._ui_sessions[short] = (phone, auth.hash, time.monotonic())
             device = auth.device_model or "device"
-            if trusted:
-                action_btn = InlineKeyboardButton(
-                    f"🛡 Untrust {device}",
-                    callback_data=f"sess_untrust_{short}",
-                )
-            else:
-                action_btn = InlineKeyboardButton(
+            row = []
+            if not trusted:
+                row.append(InlineKeyboardButton(
                     f"✅ Trust {device}",
                     callback_data=f"sess_trust_{short}",
-                )
-            keyboard_rows.append([
-                action_btn,
-                InlineKeyboardButton(
-                    "🔪 Logout",
-                    callback_data=f"revokeconfirm_{short}",
-                ),
-            ])
+                    style="success",
+                ))
+            row.append(InlineKeyboardButton(
+                f"🚪 Logout {device}",
+                callback_data=f"revokeconfirm_{short}",
+                style="danger",
+            ))
+            keyboard_rows.append(row)
 
-    keyboard_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"sessions_{phone}")])
-    keyboard_rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}")])
+    keyboard_rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"sessions_{phone}", style="primary")])
+    keyboard_rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"acc_{phone}", style="primary")])
     await render(context, chat_id, message_id, "\n".join(lines), keyboard_rows)
 
 
@@ -1212,22 +1240,22 @@ async def delete_confirm_view(context, chat_id, message_id, phone):
         return
     keyboard = [
         [
-            InlineKeyboardButton("✅ Yes, Remove", callback_data=f"delconfirm_{phone}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"acc_{phone}"),
+            InlineKeyboardButton("✅ Yes, Remove", callback_data=f"delconfirm_{phone}", style="danger"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"acc_{phone}", style="primary"),
         ]
     ]
     await render(context, chat_id, message_id, f"⚠️ Remove account <code>{html.escape(phone)}</code>?", keyboard)
 
 
 def cancel_keyboard():
-    return [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_add")]]
+    return [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_add", style="danger")]]
 
 
 def add_method_keyboard():
     return [
-        [InlineKeyboardButton("📱 Phone Number", callback_data="add_phone")],
-        [InlineKeyboardButton("🔲 QR Code", callback_data="add_qr")],
-        [InlineKeyboardButton("🔙 Back", callback_data="menu")],
+        [InlineKeyboardButton("📱 Phone Number", callback_data="add_phone", style="primary")],
+        [InlineKeyboardButton("🔲 QR Code", callback_data="add_qr", style="primary")],
+        [InlineKeyboardButton("🔙 Back", callback_data="menu", style="primary")],
     ]
 
 
@@ -1264,6 +1292,9 @@ def _new_session(chat_id: int, message_id: int, **extra) -> dict:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # [VALID #7] Defensive against channel posts
+    if update.effective_user is None or update.message is None:
+        return
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ Unauthorized")
@@ -1272,7 +1303,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reset_user_flow(context, user_id)
 
     message = await update.message.reply_text(
-        "🤖 <b>Anti-Login Bot</b>\nManage your protected accounts.",
+        "🛡️ <b>Welcome to Anti-Login Bot</b>\nSecurely manage and monitor your protected accounts.\n\n👨‍💻 Developer: @nifzz",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(main_menu_keyboard()),
     )
@@ -1280,7 +1311,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """[FEAT F] Escape hatch out of any pending add flow."""
+    # [VALID #7] Defensive against channel posts
+    if update.effective_user is None or update.message is None:
+        return
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
@@ -1292,57 +1325,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_sessions[user_id] = _new_session(msg.chat_id, msg.message_id)
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """[FEAT D] /stats — quick health summary."""
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("⛔ Unauthorized")
-        return
-    db = _session_manager.database.all()
-    total = len(db)
-    protected = sum(1 for r in db.values() if r.anti_login)
-    codes = sum(r.invalidated_codes for r in db.values())
-    sessions = sum(len(r.whitelisted_sessions) for r in db.values())
-    fps = sum(len(r.trusted_fingerprints) for r in db.values())
-    no_baseline = sum(1 for r in db.values() if not r.whitelist_initialized)
-    connected = sum(1 for p in db if p in _session_manager.clients)
-    text = (
-        "📊 <b>Stats</b>\n"
-        f"Accounts         : <b>{total}</b>\n"
-        f"Connected        : {connected}\n"
-        f"Protected        : {protected}\n"
-        f"Codes invalid    : {codes}\n"
-        f"Whitelisted      : {sessions}\n"
-        f"Trusted FP       : {fps}\n"
-        f"⚠️ No baseline  : {no_baseline}"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """[FEAT C] /search <substring> — filter accounts by phone fragment."""
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("⛔ Unauthorized")
-        return
-    query = " ".join(context.args or []).strip()
-    if not query:
-        await update.message.reply_text("Usage: /search <phone fragment>")
-        return
-    matches = [
-        (p, r) for p, r in _session_manager.database.all().items()
-        if query in p
-    ]
-    if not matches:
-        await update.message.reply_text(f"No accounts matching '{query}'.")
-        return
-    lines = [f"🔍 <b>Results for '{html.escape(query)}'</b> ({len(matches)})\n"]
-    for phone, record in sorted(matches, key=_account_sort_key):
-        status = "🔒" if record.anti_login else "🔓"
-        lines.append(f"{status} <code>{html.escape(phone)}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
 def generate_qr_image(url: str) -> io.BytesIO:
     img = qrcode.make(url)
     buf = io.BytesIO()
@@ -1352,17 +1334,16 @@ def generate_qr_image(url: str) -> io.BytesIO:
 
 
 async def _refresh_qr_token(client, qr_login):
-    """Export a new QR token, handling LoginTokenMigrateTo.
-    May raise SessionPasswordNeededError if the account has 2FA enabled —
-    the caller (watch_qr_login) is responsible for handling that case.
-    """
     resp = await client(functions.auth.ExportLoginTokenRequest(
         _config.api_id, _config.api_hash, []
     ))
     if isinstance(resp, types.auth.LoginTokenMigrateTo):
+        # [VALID #9] Guard against missing private API
+        if not hasattr(client, "_switch_dc"):
+            logger.error("Telethon private _switch_dc missing — cannot migrate DC")
+            raise RuntimeError("Telethon API changed: _switch_dc not available")
         await client._switch_dc(resp.dc_id)
         resp = await client(functions.auth.ImportLoginTokenRequest(resp.token))
-        # SessionPasswordNeededError is allowed to propagate — caller handles it.
     qr_login._resp = resp
     return resp
 
@@ -1470,7 +1451,7 @@ async def watch_qr_login(context, user_id):
                     "⌛ QR code expired.",
                     [
                         [
-                            InlineKeyboardButton("🔄 Retry", callback_data="add_qr"),
+                            InlineKeyboardButton("🔄 Retry", callback_data="add_qr", style="primary"),
                             InlineKeyboardButton("🔙 Menu", callback_data="menu"),
                         ]
                     ],
@@ -1481,8 +1462,6 @@ async def watch_qr_login(context, user_id):
             try:
                 await _refresh_qr_token(client, qr_login)
             except SessionPasswordNeededError:
-                # ── FIX: 2FA aktif saat refresh QR (mis. setelah LoginTokenMigrateTo).
-                # Client tetap terhubung — kita hanya perlu input password.
                 if user_sessions.get(user_id) is session:
                     session["step"] = "wait_password"
                     await cleanup_qr_message(context.bot, session)
@@ -1531,11 +1510,26 @@ async def watch_qr_login(context, user_id):
         )
         return
 
+    if me is None:
+        # [VALID #5] Guard None
+        logger.error("QR login: get_me returned None")
+        await cleanup_qr_message(context.bot, session)
+        user_sessions.pop(user_id, None)
+        with suppress(Exception):
+            await client.disconnect()
+        await render(
+            context, chat_id, message_id,
+            "❌ Could not fetch account info.",
+            [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]],
+        )
+        return
+
     if user_sessions.get(user_id) is not session:
         with suppress(Exception):
             await client.disconnect()
         return
 
+    # [VALID #8] normalize_phone preserves +id
     phone = normalize_phone(me.phone) if me.phone else f"+id{me.id}"
     await cleanup_qr_message(context.bot, session)
     _add_cooldown[user_id] = time.monotonic()
@@ -1547,7 +1541,6 @@ async def user_session_sweeper(bot):
         await asyncio.sleep(USER_SESSION_SWEEP_INTERVAL)
         now = time.monotonic()
         stale = []
-        # [FIX #3] Sweep stalled add-flows too (they hold live clients).
         for uid, sess in list(user_sessions.items()):
             created = sess.get("created_at", now)
             has_step = "step" in sess
@@ -1563,20 +1556,18 @@ async def user_session_sweeper(bot):
         if stale:
             logger.info("Swept %d idle user session(s)", len(stale))
 
-        # [FIX #9] TTL-clean ephemeral callback maps.
         if _session_manager:
             cutoff = time.monotonic() - UI_CACHE_TTL_SECONDS
             _session_manager._ui_sessions = {
                 k: v for k, v in _session_manager._ui_sessions.items()
                 if len(v) >= 3 and v[2] > cutoff
             }
-            _session_manager._pending_fingerprints = {
-                k: v for k, v in _session_manager._pending_fingerprints.items()
-                if len(v) >= 3 and v[2] > cutoff
-            }
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # [VALID #7] Defensive against channel posts / None
+    if update.effective_user is None or update.message is None:
+        return
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
@@ -1604,7 +1595,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not PHONE_REGEX.match(text) or text.startswith("+id"):
             await render(context, chat_id, message_id, "❌ Invalid format. Use <code>+&lt;country code&gt;&lt;number&gt;</code>, digits only.", cancel_keyboard())
             return
-        # [FIX #2] Connect inside try/except so failures never leak a client.
+        # [VALID #15] Prevent wasting an OTP on an already-registered number
+        if text in _session_manager.database:
+            await render(
+                context, chat_id, message_id,
+                f"⚠️ Account <code>{html.escape(text)}</code> already registered.",
+                cancel_keyboard(),
+            )
+            return
         client = TelegramClient(StringSession(), _config.api_id, _config.api_hash)
         try:
             await client.connect()
@@ -1634,8 +1632,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif step == "wait_code":
-        # Strip ALL non-digit chars so "1 2 3 4 5", "1-2-3-4-5", " 12345 "
-        # and "12345" are all treated identically before validating & signing in.
         code = re.sub(r"\D", "", text)
         if not CODE_REGEX.match(code):
             await render(
@@ -1670,13 +1666,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await client.sign_in(password=text)
             if not phone:
                 me = await client.get_me()
+                if me is None:
+                    raise RuntimeError("get_me returned None")
                 phone = normalize_phone(me.phone) if me.phone else f"+id{me.id}"
             await cleanup_qr_message(context.bot, session)
             await finish_add_account(context, chat_id, message_id, user_id, phone, client)
         except PasswordHashInvalidError:
             await render(context, chat_id, message_id, "❌ Incorrect password. Please try again:", cancel_keyboard())
         except Exception as e:
-            # [FIX #11] Clean up client on non-password errors to avoid leak.
             logger.error("Password login failed for %s: %s", phone, e)
             await cleanup_qr_message(context.bot, session)
             user_sessions.pop(user_id, None)
@@ -1690,7 +1687,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def finish_add_account(context, chat_id, message_id, user_id, phone, client):
-    # [FIX #1] Validate the identifier before attempting to persist.
     if not PHONE_REGEX.match(phone):
         logger.error("Refusing to add account with invalid identifier: %r", phone)
         with suppress(Exception):
@@ -1717,7 +1713,6 @@ async def finish_add_account(context, chat_id, message_id, user_id, phone, clien
         await account_detail_view(context, chat_id, message_id, phone, banner="✅ Account added successfully!\n\n")
         return
 
-    # Failure path: log out the just-created session so it doesn't linger.
     with suppress(Exception):
         await client(functions.auth.LogOutRequest())
     with suppress(Exception):
@@ -1731,6 +1726,15 @@ async def finish_add_account(context, chat_id, message_id, user_id, phone, clien
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    # [VALID #3] + [VALID #7] Guard against None message / user
+    if update.effective_user is None:
+        return
+    if query is None:
+        return
+    if query.message is None or not hasattr(query.message, "chat_id"):
+        await _safe_answer(query, "Message expired — send /start again")
+        return
+
     user_id = update.effective_user.id
     chat_id = query.message.chat_id
     message_id = query.message.message_id
@@ -1742,10 +1746,143 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
+    # ===== PRE-ACK CHECKS (cepat, butuh show_alert) =====
+    if data in ("add_acc", "add_phone", "add_qr"):
+        cd = _check_add_cooldown(user_id)
+        if cd:
+            await _safe_answer(query, cd, show_alert=True)
+            if data == "add_acc":
+                await show_main_menu(context, chat_id, message_id)
+            else:
+                await render(context, chat_id, message_id,
+                             "Choose an account addition method:", add_method_keyboard())
+            return
+
+    _session_op = None  # (kind, phone, hash, short)
+    if data.startswith("sess_trust_"):
+        short = data[len("sess_trust_"):]
+        entry = _session_manager._ui_sessions.pop(short, None)
+        if not entry or len(entry) < 2:
+            await _safe_answer(query, "Expired — reopen Sessions")
+            return
+        phone, hash_val = entry[0], entry[1]
+        if not _session_manager.database.get(phone) or not _session_manager.clients.get(phone):
+            await _safe_answer(query, "Account unavailable")
+            return
+        _session_op = ("trust", phone, hash_val, None)
+    elif data.startswith("sess_revoke_"):
+        short = data[len("sess_revoke_"):]
+        entry = _session_manager._ui_sessions.pop(short, None)
+        if not entry or len(entry) < 2:
+            await _safe_answer(query, "Expired — reopen Sessions")
+            return
+        phone, hash_val = entry[0], entry[1]
+        if not _session_manager.database.get(phone) or not _session_manager.clients.get(phone):
+            await _safe_answer(query, "Account unavailable")
+            return
+        _session_op = ("revoke", phone, hash_val, None)
+    elif data.startswith("revokeconfirm_"):
+        short = data[len("revokeconfirm_"):]
+        entry = _session_manager._ui_sessions.get(short)
+        if not entry or len(entry) < 2:
+            await _safe_answer(query, "Expired — reopen Sessions")
+            return
+        phone, hash_val = entry[0], entry[1]
+        if not _session_manager.clients.get(phone):
+            await _safe_answer(query, "Account unavailable")
+            return
+        _session_op = ("confirm", phone, hash_val, short)
+
+    # ===== ACK SEKARANG — hentikan spinner, cegah TimedOut =====
+    await _safe_answer(query)
+
     try:
         await reset_user_flow(context, user_id)
         user_sessions[user_id] = _new_session(chat_id, message_id)
 
+        # === Operasi sesi (trust / revoke / confirm) ===
+        if _session_op is not None:
+            kind, phone, hash_val, short = _session_op
+            client = _session_manager.clients.get(phone)
+            if not client:
+                await list_accounts_view(context, chat_id, message_id)
+                return
+            try:
+                result = await client(functions.account.GetAuthorizationsRequest())
+            except Exception as e:
+                logger.error("Failed to load sessions for %s (%s): %s", phone, kind, e)
+                await sessions_view(context, chat_id, message_id, phone,
+                                    banner=f"❌ Failed to load sessions: {html.escape(str(e))}\n\n")
+                return
+
+            if kind == "trust":
+                matched = next((a for a in result.authorizations if a.hash == hash_val), None)
+                if matched is None:
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="⚠️ Session not found (may already be gone).\n\n")
+                    return
+                def _trust(r):
+                    _session_manager._whitelist_session(r, matched, source="admin_ui")
+                await _session_manager.database.mutate(phone, _trust)
+                audit_logger.info("session_trusted_manual phone=%s hash=%s", phone, matched.hash)
+                await sessions_view(context, chat_id, message_id, phone,
+                                    banner="✅ Session trusted.\n\n")
+
+            elif kind == "revoke":
+                matched = next((a for a in result.authorizations if a.hash == hash_val), None)
+                if matched is None:
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="⚠️ Session not found (may already be gone).\n\n")
+                    return
+                if matched.current:
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="⚠️ Refusing to revoke the current session.\n\n")
+                    return
+                try:
+                    await client(functions.account.ResetAuthorizationRequest(hash=matched.hash))
+                    def _drop(r):
+                        r.whitelisted_sessions = [
+                            e for e in r.whitelisted_sessions if e.get("hash") != matched.hash
+                        ]
+                    await _session_manager.database.mutate(phone, _drop)
+                    audit_logger.warning("session_revoked_manual phone=%s hash=%s", phone, matched.hash)
+                    logger.warning("Manually revoked session for %s", phone)
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="✅ Session revoked.\n\n")
+                except Exception as e:
+                    logger.error("Failed to revoke session for %s: %s", phone, e)
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner=f"❌ Failed to revoke: {html.escape(str(e))}\n\n")
+
+            elif kind == "confirm":
+                target = next((a for a in result.authorizations if a.hash == hash_val), None)
+                if target is None:
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="⚠️ Session not found.\n\n")
+                    return
+                if target.current:
+                    await sessions_view(context, chat_id, message_id, phone,
+                                        banner="⚠️ Refusing to logout the current session.\n\n")
+                    return
+                keyboard = [[
+                    InlineKeyboardButton("✅ Yes, Logout",
+                                         callback_data=f"sess_revoke_{short}", style="danger"),
+                    InlineKeyboardButton("❌ Cancel",
+                                         callback_data=f"sessions_{phone}", style="primary"),
+                ]]
+                await render(
+                    context, chat_id, message_id,
+                    f"⚠️ <b>Logout this session?</b>\n\n"
+                    f"Account: <code>{html.escape(phone)}</code>\n\n"
+                    f"{_format_session(target)}"
+                    f"\nThis session will be <b>terminated immediately on Telegram's servers</b>.\n"
+                    f"The device will need to log in again.\n\n"
+                    f"<b>This action cannot be undone.</b>",
+                    keyboard,
+                )
+            return
+
+        # === Dispatch normal ===
         if data == "menu":
             await show_main_menu(context, chat_id, message_id)
 
@@ -1755,7 +1892,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             protected = sum(1 for r in db.values() if r.anti_login)
             codes = sum(r.invalidated_codes for r in db.values())
             sessions_count = sum(len(r.whitelisted_sessions) for r in db.values())
-            fps = sum(len(r.trusted_fingerprints) for r in db.values())
             no_baseline = sum(1 for r in db.values() if not r.whitelist_initialized)
             connected = sum(1 for p in db if p in _session_manager.clients)
             text = (
@@ -1765,17 +1901,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Protected        : {protected}\n"
                 f"Codes invalid    : {codes}\n"
                 f"Whitelisted      : {sessions_count}\n"
-                f"Trusted FP       : {fps}\n"
                 f"⚠️ No baseline  : {no_baseline}"
             )
-            await render(context, chat_id, message_id, text, [[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
+            await render(context, chat_id, message_id, text, [[InlineKeyboardButton("🔙 Back", callback_data="menu", style="primary")]])
 
         elif data == "add_acc":
-            cd = _check_add_cooldown(user_id)
-            if cd:
-                await _safe_answer(query, cd, show_alert=True)
-                await show_main_menu(context, chat_id, message_id)
-                return
             await render(context, chat_id, message_id, "Choose an account addition method:", add_method_keyboard())
 
         elif data == "add_phone":
@@ -1823,14 +1953,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await render(
                     context, chat_id, message_id,
                     f"✅ Account <code>{html.escape(phone)}</code> removed and session logged out.",
-                    [[InlineKeyboardButton("🔙 Back", callback_data="list_acc")]],
+                    [[InlineKeyboardButton("🔙 Back", callback_data="list_acc", style="primary")]],
                 )
             else:
                 await render(
                     context, chat_id, message_id,
                     f"⚠️ Account <code>{html.escape(phone)}</code> could not be fully removed "
                     f"(logout may have failed). Try again or check the log.",
-                    [[InlineKeyboardButton("🔙 Back", callback_data="list_acc")]],
+                    [[InlineKeyboardButton("🔙 Back", callback_data="list_acc", style="primary")]],
                 )
 
         elif data.startswith("del_"):
@@ -1844,173 +1974,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("sessions_"):
             await sessions_view(context, chat_id, message_id, data[len("sessions_"):])
 
-        elif data.startswith("sess_trust_"):
-            short = data[len("sess_trust_"):]
-            entry = _session_manager._ui_sessions.pop(short, None)
-            if not entry or len(entry) < 2:
-                await _safe_answer(query, "Expired — reopen Sessions")
-                return
-            phone, hash_val = entry[0], entry[1]
-            record = _session_manager.database.get(phone)
-            client = _session_manager.clients.get(phone)
-            if not record or not client:
-                await _safe_answer(query, "Account unavailable")
-                return
-            try:
-                result = await client(functions.account.GetAuthorizationsRequest())
-                for auth in result.authorizations:
-                    if auth.hash == hash_val:
-                        def _trust(r: AccountRecord):
-                            _session_manager._whitelist_session(r, auth, source="admin_ui")
-                        await _session_manager.database.mutate(phone, _trust)
-                        audit_logger.info("session_trusted_manual phone=%s hash=%s", phone, auth.hash)
-                        await _safe_answer(query, "Session trusted")
-                        await sessions_view(context, chat_id, message_id, phone)
-                        return
-            except Exception as e:
-                logger.error("Failed to trust session: %s", e)
-            await _safe_answer(query, "Failed to trust")
+        # Catatan: sess_trust_ / sess_revoke_ / revokeconfirm_ sudah
+        # ditangani di atas via _session_op, jadi TIDAK masuk sini lagi.
 
-        elif data.startswith("sess_untrust_"):
-            # [FEAT B] Remove trust from an existing whitelisted session.
-            short = data[len("sess_untrust_"):]
-            entry = _session_manager._ui_sessions.pop(short, None)
-            if not entry or len(entry) < 2:
-                await _safe_answer(query, "Expired — reopen Sessions")
-                return
-            phone, hash_val = entry[0], entry[1]
-            record = _session_manager.database.get(phone)
-            client = _session_manager.clients.get(phone)
-            if not record or not client:
-                await _safe_answer(query, "Account unavailable")
-                return
-            try:
-                result = await client(functions.account.GetAuthorizationsRequest())
-                for auth in result.authorizations:
-                    if auth.hash == hash_val:
-                        fp = _session_fingerprint(auth)
-
-                        def _untrust(r: AccountRecord):
-                            _session_manager._unwhitelist_session(r, hash_val, fp)
-
-                        await _session_manager.database.mutate(phone, _untrust)
-                        audit_logger.info("session_untrusted_manual phone=%s hash=%s", phone, hash_val)
-                        await _safe_answer(query, "Untrusted")
-                        await sessions_view(context, chat_id, message_id, phone)
-                        return
-            except Exception as e:
-                logger.error("Failed to untrust session: %s", e)
-            await _safe_answer(query, "Failed to untrust")
-
-        elif data.startswith("revokeconfirm_"):
-            # Confirmation step before logout — destructive action, cannot be undone.
-            short = data[len("revokeconfirm_"):]
-            entry = _session_manager._ui_sessions.get(short)
-            if not entry or len(entry) < 2:
-                await _safe_answer(query, "Expired — reopen Sessions")
-                return
-            phone, hash_val = entry[0], entry[1]
-            client = _session_manager.clients.get(phone)
-            if not client:
-                await _safe_answer(query, "Account unavailable")
-                return
-
-            # Fetch session details so the user knows which device will be logged out.
-            try:
-                result = await client(functions.account.GetAuthorizationsRequest())
-            except Exception as e:
-                logger.error("Failed to load session for revoke-confirm: %s", e)
-                await _safe_answer(query, "Failed to load session")
-                return
-
-            target = next(
-                (a for a in result.authorizations if a.hash == hash_val),
-                None,
-            )
-            if target is None:
-                await _safe_answer(query, "Session not found")
-                return
-            if target.current:
-                await _safe_answer(query, "Refusing to logout current session")
-                return
-
-            keyboard = [[
-                InlineKeyboardButton("✅ Yes, Logout", callback_data=f"sess_revoke_{short}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"sessions_{phone}"),
-            ]]
-            await render(
-                context, chat_id, message_id,
-                f"⚠️ <b>Logout this session?</b>\n\n"
-                f"Account: <code>{html.escape(phone)}</code>\n\n"
-                f"{_format_session(target)}"
-                f"\nThis session will be <b>terminated immediately on Telegram's servers</b>.\n"
-                f"The device will need to log in again.\n\n"
-                f"<b>This action cannot be undone.</b>",
-                keyboard,
-            )
-
-        elif data.startswith("sess_revoke_"):
-            short = data[len("sess_revoke_"):]
-            entry = _session_manager._ui_sessions.pop(short, None)
-            if not entry or len(entry) < 2:
-                await _safe_answer(query, "Expired — reopen Sessions")
-                return
-            phone, hash_val = entry[0], entry[1]
-            record = _session_manager.database.get(phone)
-            client = _session_manager.clients.get(phone)
-            if not record or not client:
-                await _safe_answer(query, "Account unavailable")
-                return
-            try:
-                result = await client(functions.account.GetAuthorizationsRequest())
-                for auth in result.authorizations:
-                    if auth.hash == hash_val:
-                        if auth.current:
-                            await _safe_answer(query, "Refusing to revoke current session")
-                            return
-                        await client(functions.account.ResetAuthorizationRequest(hash=auth.hash))
-
-                        def _drop(r: AccountRecord):
-                            r.whitelisted_sessions = [
-                                e for e in r.whitelisted_sessions if e.get("hash") != hash_val
-                            ]
-                        await _session_manager.database.mutate(phone, _drop)
-                        audit_logger.warning("session_revoked_manual phone=%s hash=%s", phone, hash_val)
-                        logger.warning("Manually revoked session for %s", phone)
-                        await _safe_answer(query, "Revoked")
-                        await sessions_view(context, chat_id, message_id, phone)
-                        return
-            except Exception as e:
-                logger.error("Failed to revoke session: %s", e)
-            await _safe_answer(query, "Failed to revoke")
-
-        elif data.startswith("trustfp_"):
-            short = data[len("trustfp_"):]
-            entry = _session_manager._pending_fingerprints.pop(short, None)
-            if not entry or len(entry) < 2:
-                await _safe_answer(query, "Expired")
-                return
-            phone, fp = entry[0], entry[1]
-
-            def _trust_fp(r: AccountRecord):
-                if fp not in r.trusted_fingerprints:
-                    r.trusted_fingerprints.append(fp)
-
-            record = await _session_manager.database.mutate(phone, _trust_fp)
-            if record is None:
-                await _safe_answer(query, "Account not found")
-                return
-            audit_logger.info("fingerprint_trusted phone=%s fp=%s", phone, fp)
-            await _safe_answer(query, "Device trusted — user can now re-login")
-            with suppress(Exception):
-                await query.edit_message_text(
-                    f"✅ Trusted device type:\n<code>{html.escape(fp)}</code>\n\n"
-                    f"User from this device can log in again.",
-                    parse_mode=ParseMode.HTML,
-                )
     finally:
-        # [FIX #2] Always answer exactly once.
-        await _safe_answer(query)
+        await _safe_answer(query)  # no-op kalau sudah di-ack
 
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -2028,7 +1996,6 @@ def make_post_init(session_manager: SessionManager):
             f"  Anti-Login Bot running as @{me.username}\n"
             f"  Protected accounts : {len(session_manager.phones())}\n"
             f"  Registered admins  : {len(session_manager.config.admin_ids)}\n"
-            f"  Strict fingerprint : {'OFF' if session_manager.config.trust_fingerprint else 'ON (hash-only)'}\n"
             + "=" * 46
         )
         logger.info(banner)
@@ -2052,9 +2019,6 @@ def main():
     if not config.admin_ids:
         logger.warning("No admin_ids configured — login alerts will not be delivered to anyone.")
 
-    if not config.trust_fingerprint:
-        logger.info("Strict mode: fingerprint auto-trust is DISABLED (hash whitelist only).")
-
     database = AccountDatabase(Path(ACCOUNTS_FILE))
     session_manager = SessionManager(config, database)
     _session_manager = session_manager
@@ -2072,8 +2036,6 @@ def main():
 
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("cancel", cancel_command))
-    bot_app.add_handler(CommandHandler("stats", stats_command))
-    bot_app.add_handler(CommandHandler("search", search_command))
     bot_app.add_handler(CallbackQueryHandler(button_callback))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     bot_app.add_error_handler(error_handler)
